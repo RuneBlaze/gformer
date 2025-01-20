@@ -5,14 +5,22 @@
 - Per tree conversion:
   1. Compute all-pairs distance matrix d(x,y) where d(x,y) = number of edges between taxa x and y
   2. Flatten upper triangular portion of distance matrix
-  3. Project through MLP to fixed-dimension embedding -> becomes `<gtree_tok>`
+  3. Project through MLP to fixed-dimension embedding
 
-## Transformer Input Sequence
-```
-<gtree_tok0> <gtree_tok1> ... <gtree_tokk> <end_of_user_input>
-```
-- All `<gtree_tok>` assigned position 0 (permutation-invariant)
-- Position encodings only used for output sequence tokens + <end_of_output> + <end_of_user_input>. Use sinusoidal positional encoding.
+## Encoder-Decoder Architecture
+### Encoder
+- Input: Set of k gene tree embeddings
+- All gene trees processed in parallel through transformer encoder
+- No positional encoding for gene trees (set is permutation-invariant)
+- Output: Encoded memory of all gene tree information
+
+### Decoder
+- Input: Previously generated tokens of species tree
+- Uses both:
+  1. Self-attention with causal masking (can't peek at future tokens)
+  2. Cross-attention to encoded gene trees
+- Includes sinusoidal positional encoding for output sequence
+- Generates species tree tokens one at a time
 
 ## Vocabulary
 1. Taxa labels [0-255]
@@ -28,6 +36,16 @@ Standard Newick format for rooted species tree:
 ```
 
 ## Training
-- Next token prediction with causal masking
-- Loss computed only on output sequence tokens
+- Teacher forcing: Use ground truth tokens as decoder input
+- Shifted right by one position (predict next token)
+- Loss computed only on output sequence predictions
 - All gene trees assumed to have same number of taxa (for initial implementation)
+- Uses cross-entropy loss with padding token ignored
+
+## Model Details
+- Based on standard Transformer architecture
+- Embedding dimension: 768 (GPT2-small)
+- Number of heads: 12
+- Number of layers: 12 (both encoder and decoder)
+- MLP hidden dimension: 3072
+- Pre-layer normalization for better training stability

@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2.2.2",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
+    "treeswift>=1.1.45",
 ]
 
 [tool.uv]

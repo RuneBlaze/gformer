@@ -6,11 +6,13 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
+import os
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from layers import END_OF_INPUT, END_OF_OUTPUT, VOCAB_SIZE, TreeTransformer
+from data import TreeDataset
 
 
 def encode_distance_matrix(distance_matrix: np.ndarray) -> torch.Tensor:
@@ -54,55 +56,43 @@ class InputPair:
     gtrees: list[str]
     species_tree: str
 
-    def to_distance_matrix(self) -> np.ndarray:
-        # Later implemented.
-        ...
-
-
-class TreeDataset(Dataset):
-    def __init__(self, jsonl_path: str, max_sequence_length: int = 1024):
-        self.max_sequence_length = max_sequence_length
-        self.data: List[InputPair] = []
-
-        # Load data from jsonl file
-        with open(jsonl_path, "r") as f:
-            for line in f:
-                item = json.loads(line)
-                self.data.append(
-                    InputPair(gtrees=item["gtrees"], species_tree=item["species_tree"])
-                )
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def encode_trees(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Encode input trees
-        encoded_trees = []
-        for tree in pair.gtrees:
-            distance_matrix = pair.to_distance_matrix()  # You'll implement this
-            encoded = encode_distance_matrix(distance_matrix)
-            encoded_trees.append(encoded)
-
-        # Stack encoded trees
-        tree_tensor = torch.stack(encoded_trees, dim=0)
-
-        # Tokenize output species tree (you'll need to implement this)
-        species_tokens = tokenize_newick(pair.species_tree)
-
-        # Add EOI and EOS tokens
-        species_tokens = torch.cat(
-            [
-                torch.tensor([END_OF_INPUT]),
-                species_tokens,
-                torch.tensor([END_OF_OUTPUT]),
-            ]
-        )
-
-        return tree_tensor, species_tokens
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        pair = self.data[idx]
-        return self.encode_trees(pair)
+    @staticmethod
+    def newick_to_distance_matrix(newick_str: str) -> np.ndarray:
+        """
+        Convert a single Newick format tree string to a topological distance matrix.
+        Each entry d[i,j] represents the number of edges between taxa i and j,
+        ignoring edge lengths.
+        
+        Args:
+            newick_str: Tree in Newick format
+            
+        Returns:
+            np.ndarray: NxN distance matrix where N is number of taxa
+        """
+        # Parse newick string into TreeSwift tree
+        tree = ts.read_tree_newick(newick_str)
+        
+        # Set all edge lengths to 1 for topological distance
+        for node in tree.traverse_postorder():
+            if not node.is_root():
+                node.edge_length = 1
+                
+        # Get distance matrix as dictionary using TreeSwift's built-in method
+        dist_dict = tree.distance_matrix(leaf_labels=True)
+        
+        # Get sorted list of taxa names to ensure consistent ordering
+        taxa = sorted(dist_dict.keys())
+        n = len(taxa)
+        
+        # Create numpy array from distance dictionary
+        dist_matrix = np.zeros((n, n), dtype=np.uint8)
+        for i, u in enumerate(taxa):
+            for j, v in enumerate(taxa):
+                if i != j:
+                    # No need to round since all distances will be integers
+                    dist_matrix[i,j] = int(dist_dict[u][v])
+                    
+        return dist_matrix
 
 
 def create_causal_mask(
@@ -132,6 +122,7 @@ def train_epoch(
     model: TreeTransformer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.OneCycleLR,
     device: torch.device,
     epoch: int,
 ) -> float:
@@ -144,30 +135,38 @@ def train_epoch(
         target_seq = target_seq.to(device)
 
         batch_size = tree_encodings.size(0)
-        num_trees = tree_encodings.size(1)
+        seq_length = target_seq.size(1)
 
-        # Create attention mask
-        attention_mask = create_causal_mask(
-            target_seq.size(1) + num_trees, num_trees, device
-        )
+        # Teacher forcing: use target sequence as input, shifted right
+        decoder_input = target_seq[:, :-1]  # Remove last token
+        target_output = target_seq[:, 1:]   # Remove first token
+
+        # Create causal mask for decoder self-attention
+        attention_mask = torch.triu(
+            torch.ones(decoder_input.size(1), decoder_input.size(1)),
+            diagonal=1
+        ).bool().to(device)
 
         # Forward pass
         logits = model(
             tree_encodings=tree_encodings,
-            output_tokens=target_seq,
+            output_tokens=decoder_input,
             attention_mask=attention_mask,
         )
 
-        # Compute loss (only on output sequence, not tree encodings)
+        # Compute loss
         loss = F.cross_entropy(
-            logits[:, num_trees:-1, :].reshape(-1, VOCAB_SIZE),
-            target_seq[:, 1:].reshape(-1),
+            logits.reshape(-1, VOCAB_SIZE),
+            target_output.reshape(-1),
+            ignore_index=END_OF_INPUT,  # Ignore padding tokens
         )
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
 
@@ -175,6 +174,69 @@ def train_epoch(
         progress_bar.set_postfix({"loss": loss.item()})
 
     return total_loss / len(dataloader)
+
+
+def compute_tree_accuracy(predicted_tokens: torch.Tensor, target_tokens: torch.Tensor) -> float:
+    """Compute accuracy of tree topology prediction"""
+    # Ignore padding tokens in comparison
+    mask = target_tokens != END_OF_INPUT  # Using constant from layers module
+    correct = (predicted_tokens == target_tokens) & mask
+    return correct.float().sum() / mask.sum()
+
+
+def validate(model, val_loader, device) -> dict:
+    model.eval()
+    metrics = {
+        'loss': 0.0,
+        'accuracy': 0.0
+    }
+    
+    with torch.no_grad():
+        for tree_encodings, target_seq in val_loader:
+            tree_encodings = tree_encodings.to(device)
+            target_seq = target_seq.to(device)
+
+            num_trees = tree_encodings.size(1)
+            seq_length = target_seq.size(1)
+            
+            sequence_loss = 0
+            sequence_correct = 0
+            total_tokens = 0
+            
+            # Evaluate each position in sequence
+            for pos in range(1, seq_length):
+                partial_target = target_seq[:, :pos]
+                attention_mask = create_causal_mask(
+                    pos + num_trees, num_trees, device
+                )
+
+                logits = model(
+                    tree_encodings=tree_encodings,
+                    output_tokens=partial_target,
+                    attention_mask=attention_mask,
+                )
+
+                # Loss for next token prediction
+                loss = F.cross_entropy(
+                    logits[:, -1, :],
+                    target_seq[:, pos],
+                )
+                sequence_loss += loss.item()
+                
+                # Accuracy for next token prediction
+                pred = logits[:, -1, :].argmax(dim=-1)
+                correct = (pred == target_seq[:, pos])
+                sequence_correct += correct.sum().item()
+                total_tokens += target_seq.size(0)
+
+            metrics['loss'] += sequence_loss / (seq_length - 1)
+            metrics['accuracy'] += sequence_correct / total_tokens
+    
+    # Average metrics
+    for k in metrics:
+        metrics[k] /= len(val_loader)
+        
+    return metrics
 
 
 def main():
@@ -200,6 +262,10 @@ def main():
         default="checkpoints",
         help="Directory to save model checkpoints",
     )
+    parser.add_argument('--grad-clip', type=float, default=1.0, 
+                       help='Gradient clipping value')
+    parser.add_argument('--warmup-steps', type=int, default=1000,
+                       help='Learning rate warmup steps')
 
     args = parser.parse_args()
 
@@ -208,7 +274,6 @@ def main():
     logger = logging.getLogger(__name__)
 
     # Create save directory
-    import os
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -231,44 +296,30 @@ def main():
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Add learning rate scheduler
+    total_steps = len(train_loader) * args.epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=args.warmup_steps/total_steps
+    )
+
     # Training loop
     best_val_loss = float("inf")
     for epoch in range(args.epochs):
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, epoch)
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, epoch)
         logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
 
         # Validate
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for tree_encodings, target_seq in val_loader:
-                tree_encodings = tree_encodings.to(device)
-                target_seq = target_seq.to(device)
-
-                num_trees = tree_encodings.size(1)
-                attention_mask = create_causal_mask(
-                    target_seq.size(1) + num_trees, num_trees, device
-                )
-
-                logits = model(
-                    tree_encodings=tree_encodings,
-                    output_tokens=target_seq,
-                    attention_mask=attention_mask,
-                )
-
-                loss = F.cross_entropy(
-                    logits[:, num_trees:-1, :].reshape(-1, VOCAB_SIZE),
-                    target_seq[:, 1:].reshape(-1),
-                )
-                val_loss += loss.item()
-
-        val_loss /= len(val_loader)
-        logger.info(f"Epoch {epoch} - Validation loss: {val_loss:.4f}")
+        val_metrics = validate(model, val_loader, device)
+        logger.info(f"Epoch {epoch} - Validation loss: {val_metrics['loss']:.4f}")
+        logger.info(f"Epoch {epoch} - Validation accuracy: {val_metrics['accuracy']:.4f}")
 
         # Save checkpoint if validation loss improved
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
             checkpoint_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pt")
             torch.save(
                 {
@@ -276,7 +327,8 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "train_loss": train_loss,
-                    "val_loss": val_loss,
+                    "val_loss": val_metrics['loss'],
+                    "val_accuracy": val_metrics['accuracy'],
                 },
                 checkpoint_path,
             )
@@ -285,10 +337,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# Helper function to be implemented
-def tokenize_newick(newick_str: str) -> torch.Tensor:
-    """Convert Newick string to sequence of token indices"""
-    # You'll need to implement this based on your tokenization scheme
-    ...
