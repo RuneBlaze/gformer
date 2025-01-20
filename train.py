@@ -8,8 +8,9 @@ import os
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import math
 
-from layers import END_OF_INPUT, END_OF_OUTPUT, VOCAB_SIZE, TreeTransformer
+from layers import END_OF_INPUT, END_OF_OUTPUT, VOCAB_SIZE, TreeTransformer, ModelConfig
 from data import TreeDataset
 
 
@@ -114,6 +115,19 @@ def create_causal_mask(
     )
 
     return mask
+
+
+def get_scheduler(optimizer, total_steps: int, warmup_steps: int):
+    """
+    Creates a learning rate scheduler with linear warmup and cosine decay
+    """
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train_epoch(
@@ -237,100 +251,134 @@ def validate(model, val_loader, device) -> dict:
     return metrics
 
 
+def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
+    """Count total and trainable parameters in the model"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train TreeTransformer model")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Training subcommand
+    train_parser = subparsers.add_parser('train', help='Train the model')
+    train_parser.add_argument(
         "--train-data", type=str, required=True, help="Path to training data JSONL file"
     )
-    parser.add_argument(
+    train_parser.add_argument(
         "--val-data", type=str, required=True, help="Path to validation data JSONL file"
     )
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument(
+    train_parser.add_argument(
+        "--config", type=str, required=True, help="Path to model config YAML"
+    )
+    train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    train_parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    train_parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to train on",
     )
-    parser.add_argument(
+    train_parser.add_argument(
         "--save-dir",
         type=str,
         default="checkpoints",
         help="Directory to save model checkpoints",
     )
-    parser.add_argument('--grad-clip', type=float, default=1.0, 
+    train_parser.add_argument('--grad-clip', type=float, default=1.0, 
                        help='Gradient clipping value')
-    parser.add_argument('--warmup-steps', type=int, default=1000,
+    train_parser.add_argument('--warmup-steps', type=int, default=1000,
                        help='Learning rate warmup steps')
+
+    # Count parameters subcommand
+    count_parser = subparsers.add_parser('count-params', help='Count model parameters')
+    count_parser.add_argument(
+        "--config", type=str, required=True, help="Path to model config YAML"
+    )
+    count_parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to initialize model on",
+    )
 
     args = parser.parse_args()
 
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
+    if args.command == 'count-params':
+        device = torch.device(args.device)
+        config = ModelConfig.from_yaml(args.config)
+        model = TreeTransformer(config).to(device)
+        total_params, trainable_params = count_parameters(model)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        return
 
-    # Create save directory
+    elif args.command == 'train':
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+        # Create save directory
+        os.makedirs(args.save_dir, exist_ok=True)
 
-    # Initialize model and move to device
-    device = torch.device(args.device)
-    model = TreeTransformer().to(device)
+        # Initialize model and move to device
+        device = torch.device(args.device)
+        config = ModelConfig.from_yaml(args.config)
+        model = TreeTransformer(config).to(device)
 
-    # Create datasets and dataloaders
-    train_dataset = TreeDataset(args.train_data)
-    val_dataset = TreeDataset(args.val_data)
+        # Create datasets and dataloaders
+        train_dataset = TreeDataset(args.train_data)
+        val_dataset = TreeDataset(args.val_data)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
-    )
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
+        )
 
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
-    )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
+        )
 
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        # Initialize optimizer
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    # Add learning rate scheduler
-    total_steps = len(train_loader) * args.epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=args.warmup_steps/total_steps
-    )
+        # Add cosine learning rate scheduler with warmup
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_scheduler(
+            optimizer,
+            total_steps=total_steps,
+            warmup_steps=args.warmup_steps
+        )
 
-    # Training loop
-    best_val_loss = float("inf")
-    for epoch in range(args.epochs):
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, epoch)
-        logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
+        # Training loop
+        best_val_loss = float("inf")
+        for epoch in range(args.epochs):
+            # Train
+            train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, epoch)
+            logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
 
-        # Validate
-        val_metrics = validate(model, val_loader, device)
-        logger.info(f"Epoch {epoch} - Validation loss: {val_metrics['loss']:.4f}")
-        logger.info(f"Epoch {epoch} - Validation accuracy: {val_metrics['accuracy']:.4f}")
+            # Validate
+            val_metrics = validate(model, val_loader, device)
+            logger.info(f"Epoch {epoch} - Validation loss: {val_metrics['loss']:.4f}")
+            logger.info(f"Epoch {epoch} - Validation accuracy: {val_metrics['accuracy']:.4f}")
 
-        # Save checkpoint if validation loss improved
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            checkpoint_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss": val_metrics['loss'],
-                    "val_accuracy": val_metrics['accuracy'],
-                },
-                checkpoint_path,
-            )
-            logger.info(f"Saved checkpoint to {checkpoint_path}")
+            # Save checkpoint if validation loss improved
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                checkpoint_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "train_loss": train_loss,
+                        "val_loss": val_metrics['loss'],
+                        "val_accuracy": val_metrics['accuracy'],
+                    },
+                    checkpoint_path,
+                )
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
 
 
 if __name__ == "__main__":

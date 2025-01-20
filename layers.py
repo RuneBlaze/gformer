@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
+import yaml
 
 # Constants
 MAX_TAXA = 256  # Maximum number of taxa (0-255)
@@ -84,49 +86,66 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[start_pos : start_pos + x.size(1)]
 
 
+@dataclass
+class ModelConfig:
+    embedding_dim: int
+    num_heads: int
+    num_layers: int
+    mlp_hidden_dim: int
+    tree_embedding_dim: int
+    max_sequence_length: int
+    vocab_size: int
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "ModelConfig":
+        with open(yaml_path) as f:
+            config = yaml.safe_load(f)
+        return cls(**config["model"])
+
+
 class TreeTransformer(nn.Module):
     """
     Encoder-decoder transformer model for processing gene trees and generating species trees.
     """
 
-    def __init__(self):
+    def __init__(self, config: ModelConfig):
         super().__init__()
 
         # Token embedding layer
-        self.token_embedding = nn.Embedding(VOCAB_SIZE, EMBEDDING_DIM)
+        self.token_embedding = nn.Embedding(config.vocab_size, config.embedding_dim)
 
         # Tree embedding MLP
         self.tree_embedding = DistanceMatrixMLP(
             input_dim=8,  # Binary distance encoding dimension
-            hidden_dim=EMBEDDING_DIM * 2,
-            output_dim=TREE_EMBEDDING_DIM,
+            hidden_dim=config.embedding_dim * 2,
+            output_dim=config.tree_embedding_dim,
         )
 
         # Positional encoding
-        self.pos_encoding = PositionalEncoding(EMBEDDING_DIM)
+        self.pos_encoding = PositionalEncoding(config.embedding_dim, config.max_sequence_length)
 
         # Encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=EMBEDDING_DIM,
-            nhead=NUM_HEADS,
-            dim_feedforward=MLP_HIDDEN_DIM,
-            batch_first=True,
-            norm_first=True,  # Pre-LN architecture for better stability
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=NUM_LAYERS)
-
-        # Decoder layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=EMBEDDING_DIM,
-            nhead=NUM_HEADS,
-            dim_feedforward=MLP_HIDDEN_DIM,
+            d_model=config.embedding_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.mlp_hidden_dim,
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=NUM_LAYERS)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+
+        # Decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.embedding_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.mlp_hidden_dim,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
 
         # Output projection
-        self.output_projection = nn.Linear(EMBEDDING_DIM, VOCAB_SIZE)
+        self.output_projection = nn.Linear(config.embedding_dim, config.vocab_size)
 
     def forward(
         self,

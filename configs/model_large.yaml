@@ -1,0 +1,15 @@
+# Large model (~200M parameters) for production
+model:
+  embedding_dim: 768  # GPT2-small size
+  num_heads: 12
+  num_layers: 12
+  mlp_hidden_dim: 3072  # 4x embedding dim
+  tree_embedding_dim: 768
+  max_sequence_length: 1024
+  vocab_size: 260  # Unchanged - depends on tokenizer
+
+training:
+  batch_size: 32
+  learning_rate: 1e-4
+  warmup_steps: 1000
+  grad_clip: 1.0 

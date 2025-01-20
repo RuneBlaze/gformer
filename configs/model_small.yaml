@@ -1,0 +1,15 @@
+# Small model (~28M parameters) for testing
+model:
+  embedding_dim: 384  # Half of GPT2-small
+  num_heads: 6
+  num_layers: 6
+  mlp_hidden_dim: 1536  # 4x embedding dim
+  tree_embedding_dim: 384
+  max_sequence_length: 1024
+  vocab_size: 260  # Unchanged - depends on tokenizer
+
+training:
+  batch_size: 32
+  learning_rate: 1e-4
+  warmup_steps: 1000
+  grad_clip: 1.0 
