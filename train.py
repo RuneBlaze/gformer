@@ -265,10 +265,15 @@ def main():
     # Training subcommand
     train_parser = subparsers.add_parser('train', help='Train the model')
     train_parser.add_argument(
-        "--train-data", type=str, required=True, help="Path to training data JSONL file"
+        "--data", type=str, required=True, 
+        help="Path to data file (.jsonl or .parquet)"
     )
     train_parser.add_argument(
-        "--val-data", type=str, required=True, help="Path to validation data JSONL file"
+        "--lr", type=float, default=1e-4, help="Learning rate"
+    )
+    train_parser.add_argument(
+        "--val-ratio", type=float, default=0.2,
+        help="Ratio of directories to use for validation (for parquet files)"
     )
     train_parser.add_argument(
         "--config", type=str, required=True, help="Path to model config YAML"
@@ -291,6 +296,10 @@ def main():
                        help='Gradient clipping value')
     train_parser.add_argument('--warmup-steps', type=int, default=1000,
                        help='Learning rate warmup steps')
+    train_parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    train_parser.add_argument('--num-workers', type=int, default=4,
+                       help='Number of processes for parallel preprocessing')
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser('count-params', help='Count model parameters')
@@ -328,16 +337,38 @@ def main():
         config = ModelConfig.from_yaml(args.config)
         model = TreeTransformer(config).to(device)
 
-        # Create datasets and dataloaders
-        train_dataset = TreeDataset(args.train_data)
-        val_dataset = TreeDataset(args.val_data)
+        # Create datasets with automatic train/val splitting
+        train_dataset = TreeDataset(
+            args.data,
+            split='train',
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            num_workers=args.num_workers
+        )
+        
+        val_dataset = TreeDataset(
+            args.data,
+            split='val', 
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            num_workers=args.num_workers
+        )
+
+        logger.info(f"Training dataset size: {len(train_dataset)}")
+        logger.info(f"Validation dataset size: {len(val_dataset)}")
 
         train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
+            train_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=True, 
+            num_workers=args.num_workers
         )
 
         val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
+            val_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=False, 
+            num_workers=args.num_workers
         )
 
         # Initialize optimizer
