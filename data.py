@@ -13,7 +13,7 @@ from tokenizer import NewickTokenizer
 @dataclass
 class InputPair:
     gtrees: list[str]
-    species_tree: str
+    stree: str
 
     @staticmethod
     def newick_to_distance_matrix(newick_str: str) -> np.ndarray:
@@ -78,7 +78,7 @@ class TreeDataset(Dataset):
             for line in f:
                 item = json.loads(line)
                 self.data.append(
-                    InputPair(gtrees=item["gtrees"], species_tree=item["species_tree"])
+                    InputPair(gtrees=item["gtrees"], stree=item["species_tree"])
                 )
         
         print("Pre-encoding trees...")
@@ -97,7 +97,7 @@ class TreeDataset(Dataset):
             encoded_trees.append(encoded)
 
         tree_tensor = torch.stack(encoded_trees, dim=0)
-        species_tokens = torch.tensor(self.tokenizer.encode(pair.species_tree))
+        species_tokens = torch.tensor(self.tokenizer.encode(pair.stree))
         species_tokens = torch.cat(
             [
                 torch.tensor([self.tokenizer.EOI]),
