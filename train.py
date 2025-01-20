@@ -9,6 +9,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import math
+import yaml
+import treeswift as ts
+from torch.cuda.amp import autocast, GradScaler
+try:
+    from transformers.optimization import Adafactor
+    HAVE_ADAFACTOR = True
+except ImportError:
+    HAVE_ADAFACTOR = False
 
 from layers import END_OF_INPUT, END_OF_OUTPUT, VOCAB_SIZE, TreeTransformer, ModelConfig
 from data import TreeDataset
@@ -130,13 +138,47 @@ def get_scheduler(optimizer, total_steps: int, warmup_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def get_optimizer(model: torch.nn.Module, config: "TrainingConfig"):
+    """Get memory efficient optimizer based on config"""
+    optimizer_name = config.optimizer["name"].lower()
+    
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            fused=config.optimizer.get("memory_efficient", False)  # Use fused if available
+        )
+    elif optimizer_name == "adam":
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=config.learning_rate,
+            fused=config.optimizer.get("memory_efficient", False)
+        )
+    elif optimizer_name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=config.learning_rate
+        )
+    elif optimizer_name == "adafactor" and HAVE_ADAFACTOR:
+        return Adafactor(
+            model.parameters(),
+            lr=config.learning_rate,
+            scale_parameter=False,
+            relative_step=False
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+
 def train_epoch(
     model: TreeTransformer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
     device: torch.device,
     epoch: int,
+    scaler: GradScaler = None,
+    mixed_precision: bool = False,
 ) -> float:
     model.train()
     total_loss = 0
@@ -146,43 +188,38 @@ def train_epoch(
         tree_encodings = tree_encodings.to(device)
         target_seq = target_seq.to(device)
 
-        batch_size = tree_encodings.size(0)
-        seq_length = target_seq.size(1)
-
-        # Teacher forcing: use target sequence as input, shifted right
-        decoder_input = target_seq[:, :-1]  # Remove last token
-        target_output = target_seq[:, 1:]   # Remove first token
-
-        # Create causal mask for decoder self-attention
-        attention_mask = torch.triu(
-            torch.ones(decoder_input.size(1), decoder_input.size(1)),
-            diagonal=1
-        ).bool().to(device)
-
-        # Forward pass
-        logits = model(
-            tree_encodings=tree_encodings,
-            output_tokens=decoder_input,
-            attention_mask=attention_mask,
-        )
-
-        # Compute loss
-        loss = F.cross_entropy(
-            logits.reshape(-1, VOCAB_SIZE),
-            target_output.reshape(-1),
-            ignore_index=END_OF_INPUT,  # Ignore padding tokens
-        )
-
-        # Backward pass
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        
+        # Use automatic mixed precision if enabled
+        with autocast(enabled=mixed_precision):
+            # Forward pass
+            logits = model(
+                tree_encodings=tree_encodings,
+                output_tokens=target_seq[:, :-1],
+                attention_mask=None  # Will be auto-generated
+            )
+
+            # Compute loss
+            loss = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                target_seq[:, 1:].reshape(-1),
+                ignore_index=END_OF_INPUT,
+            )
+
+        # Backward pass with mixed precision support
+        if mixed_precision and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
         scheduler.step()
-
         total_loss += loss.item()
-
-        # Update progress bar
         progress_bar.set_postfix({"loss": loss.item()})
 
     return total_loss / len(dataloader)
@@ -258,6 +295,33 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     return total_params, trainable_params
 
 
+@dataclass
+class TrainingConfig:
+    batch_size: int
+    learning_rate: float
+    warmup_steps: int
+    grad_clip: float
+    optimizer: dict
+    mixed_precision: bool
+    gradient_checkpointing: bool
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "TrainingConfig":
+        with open(yaml_path) as f:
+            config = yaml.safe_load(f)
+        
+        training_config = config["training"]
+        return cls(
+            batch_size=int(training_config["batch_size"]),
+            learning_rate=float(training_config["learning_rate"]),
+            warmup_steps=int(training_config["warmup_steps"]),
+            grad_clip=float(training_config["grad_clip"]),
+            optimizer=training_config["optimizer"],
+            mixed_precision=training_config.get("mixed_precision", False),
+            gradient_checkpointing=training_config.get("gradient_checkpointing", False)
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train TreeTransformer model")
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
@@ -269,7 +333,8 @@ def main():
         help="Path to data file (.jsonl or .parquet)"
     )
     train_parser.add_argument(
-        "--lr", type=float, default=1e-4, help="Learning rate"
+        "--lr", type=float,
+        help="Learning rate (overrides config file)"
     )
     train_parser.add_argument(
         "--val-ratio", type=float, default=0.2,
@@ -278,7 +343,10 @@ def main():
     train_parser.add_argument(
         "--config", type=str, required=True, help="Path to model config YAML"
     )
-    train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    train_parser.add_argument(
+        "--batch-size", type=int, 
+        help="Batch size (overrides config file)"
+    )
     train_parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     train_parser.add_argument(
         "--device",
@@ -292,10 +360,14 @@ def main():
         default="checkpoints",
         help="Directory to save model checkpoints",
     )
-    train_parser.add_argument('--grad-clip', type=float, default=1.0, 
-                       help='Gradient clipping value')
-    train_parser.add_argument('--warmup-steps', type=int, default=1000,
-                       help='Learning rate warmup steps')
+    train_parser.add_argument(
+        '--grad-clip', type=float,
+        help='Gradient clipping value (overrides config file)'
+    )
+    train_parser.add_argument(
+        '--warmup-steps', type=int,
+        help='Learning rate warmup steps (overrides config file)'
+    )
     train_parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
     train_parser.add_argument('--num-workers', type=int, default=4,
@@ -357,36 +429,61 @@ def main():
         logger.info(f"Training dataset size: {len(train_dataset)}")
         logger.info(f"Validation dataset size: {len(val_dataset)}")
 
+        # Load both configs
+        training_config = TrainingConfig.from_yaml(args.config)
+
+        # Use config values unless overridden by command line
+        batch_size = args.batch_size or training_config.batch_size
+        learning_rate = args.lr or training_config.learning_rate
+        warmup_steps = args.warmup_steps or training_config.warmup_steps
+        grad_clip = args.grad_clip or training_config.grad_clip
+
+        # Create datasets with the configured batch size
         train_loader = DataLoader(
             train_dataset, 
-            batch_size=args.batch_size, 
+            batch_size=batch_size,  # Use the resolved batch_size
             shuffle=True, 
             num_workers=args.num_workers
         )
 
         val_loader = DataLoader(
             val_dataset, 
-            batch_size=args.batch_size, 
+            batch_size=batch_size,  # Use the resolved batch_size
             shuffle=False, 
             num_workers=args.num_workers
         )
 
-        # Initialize optimizer
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        # Enable gradient checkpointing if configured
+        if training_config.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+
+        # Initialize mixed precision scaler if enabled
+        scaler = GradScaler() if training_config.mixed_precision else None
+
+        # Get memory efficient optimizer
+        optimizer = get_optimizer(model, training_config)
 
         # Add cosine learning rate scheduler with warmup
         total_steps = len(train_loader) * args.epochs
         scheduler = get_scheduler(
             optimizer,
             total_steps=total_steps,
-            warmup_steps=args.warmup_steps
+            warmup_steps=warmup_steps
         )
 
         # Training loop
         best_val_loss = float("inf")
         for epoch in range(args.epochs):
-            # Train
-            train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, epoch)
+            train_loss = train_epoch(
+                model, 
+                train_loader,
+                optimizer,
+                scheduler,
+                device,
+                epoch,
+                scaler=scaler,
+                mixed_precision=training_config.mixed_precision
+            )
             logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
 
             # Validate

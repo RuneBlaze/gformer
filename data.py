@@ -13,7 +13,7 @@ import argparse
 import pyarrow.parquet as pq
 import random
 from multiprocessing import Pool, cpu_count
-
+from constants import MAX_TAXA
 from tokenizer import NewickTokenizer
 
 console = Console()
@@ -42,7 +42,7 @@ class InputPair:
         
         # Get sorted list of taxa names to ensure consistent ordering
         taxa = sorted(dist_dict.keys())
-        n = len(taxa)
+        n = MAX_TAXA
         
         # Create numpy array from distance dictionary
         dist_matrix = np.zeros((n, n), dtype=np.uint8)
@@ -187,7 +187,13 @@ class TreeDataset(Dataset):
         return [self.encode_trees(pair) for pair in pairs]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.cached_encodings[idx]
+        tree_tensor, species_tokens = self.cached_encodings[idx]
+        
+        # Pad tree tensor to max taxa size instead of 512
+        padded_tree_tensor = torch.zeros(MAX_TAXA, tree_tensor.size(1), tree_tensor.size(2))
+        padded_tree_tensor[:tree_tensor.size(0)] = tree_tensor
+        
+        return padded_tree_tensor, species_tokens
 
 
 def parse_args():

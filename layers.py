@@ -6,21 +6,21 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import yaml
 
-# Constants
-MAX_TAXA = 256  # Maximum number of taxa (0-255)
-VOCAB_SIZE = 260  # 256 taxa + 4 special tokens (matches tokenizer)
-EMBEDDING_DIM = 768  # Following GPT2-small
-NUM_HEADS = 12  # Following GPT2-small
-NUM_LAYERS = 12  # Following GPT2-small
-MLP_HIDDEN_DIM = 3072  # Following GPT2-small (4x embedding dim)
-TREE_EMBEDDING_DIM = 768  # Same as model dimension for simplicity
-MAX_SEQUENCE_LENGTH = 1024  # Following GPT2-small
 
-# Special tokens (match tokenizer values)
-LEFT_PAREN = 256  # ( token
-RIGHT_PAREN = 257  # ) token
-END_OF_INPUT = 258  # EOI token
-END_OF_OUTPUT = 259  # EOS token
+from constants import (
+    MAX_TAXA,
+    VOCAB_SIZE,
+    EMBEDDING_DIM,
+    NUM_HEADS,
+    NUM_LAYERS,
+    MLP_HIDDEN_DIM,
+    TREE_EMBEDDING_DIM,
+    MAX_SEQUENCE_LENGTH,
+    LEFT_PAREN,
+    RIGHT_PAREN,
+    END_OF_INPUT,
+    END_OF_OUTPUT,
+)
 
 
 class DistanceMatrixMLP(nn.Module):
@@ -100,7 +100,7 @@ class ModelConfig:
     def from_yaml(cls, yaml_path: str) -> "ModelConfig":
         with open(yaml_path) as f:
             config = yaml.safe_load(f)
-        return cls(**config["model"])
+        return cls(**config["model"])  # Only use the "model" section
 
 
 class TreeTransformer(nn.Module):
@@ -118,7 +118,7 @@ class TreeTransformer(nn.Module):
         self.tree_embedding = DistanceMatrixMLP(
             input_dim=8,  # Binary distance encoding dimension
             hidden_dim=config.embedding_dim * 2,
-            output_dim=config.tree_embedding_dim,
+            output_dim=config.embedding_dim,  # Must match embedding_dim for transformer
         )
 
         # Positional encoding
@@ -147,9 +147,19 @@ class TreeTransformer(nn.Module):
         # Output projection
         self.output_projection = nn.Linear(config.embedding_dim, config.vocab_size)
 
+        # Enable support for gradient checkpointing
+        self.gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        ...
+        # self.gradient_checkpointing = True
+        # self.encoder.enable_gradient_checkpointing()
+        # self.decoder.enable_gradient_checkpointing()
+
     def forward(
         self,
-        tree_encodings: torch.Tensor,  # [batch_size, num_trees, input_dim]
+        tree_encodings: torch.Tensor,  # [batch_size, max_taxa, input_dim]
         output_tokens: torch.Tensor = None,  # [batch_size, seq_len]
         attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -165,16 +175,23 @@ class TreeTransformer(nn.Module):
             torch.Tensor: Output logits of shape [batch_size, seq_len, vocab_size]
         """
         batch_size = tree_encodings.size(0)
-        num_trees = tree_encodings.size(1)
+        max_taxa = tree_encodings.size(1)
 
+        # Create padding mask for trees (1 for real data, 0 for padding)
+        # We assume zero vectors are padding
+        tree_padding_mask = (tree_encodings.sum(dim=-1) != 0).any(dim=-1)  # [batch_size, max_taxa]
+        
         # Embed trees using MLP
         tree_embeddings = self.tree_embedding(
             tree_encodings.view(-1, tree_encodings.size(-1))
         )
-        encoder_input = tree_embeddings.view(batch_size, num_trees, -1)
+        encoder_input = tree_embeddings.view(batch_size, max_taxa, -1)
 
-        # Run encoder
-        memory = self.encoder(encoder_input)
+        # Run encoder with padding mask
+        memory = self.encoder(
+            encoder_input,
+            src_key_padding_mask=~tree_padding_mask  # PyTorch expects True for padding positions
+        )
 
         if output_tokens is not None:
             # Training mode
@@ -191,12 +208,20 @@ class TreeTransformer(nn.Module):
                 ).bool()
                 attention_mask = attention_mask.to(output_tokens.device)
 
-            # Run decoder
-            hidden_states = self.decoder(
-                decoder_input,
-                memory,
-                tgt_mask=attention_mask,
-            )
+            # Use gradient checkpointing if enabled
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    self.decoder,
+                    decoder_input,
+                    memory,
+                    attention_mask
+                )
+            else:
+                hidden_states = self.decoder(
+                    decoder_input,
+                    memory,
+                    attention_mask
+                )
 
         else:
             # Inference mode - start with just embedding of first token

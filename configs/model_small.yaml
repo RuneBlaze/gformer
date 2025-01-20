@@ -1,15 +1,20 @@
 # Small model (~28M parameters) for testing
 model:
-  embedding_dim: 384  # Half of GPT2-small
-  num_heads: 6
-  num_layers: 6
-  mlp_hidden_dim: 1536  # 4x embedding dim
-  tree_embedding_dim: 384
+  embedding_dim: 256  # Even smaller for testing
+  num_heads: 2
+  num_layers: 2
+  mlp_hidden_dim: 1024  # 4x embedding dim
+  tree_embedding_dim: 256
   max_sequence_length: 1024
   vocab_size: 260  # Unchanged - depends on tokenizer
 
 training:
-  batch_size: 32
+  batch_size: 1
   learning_rate: 1e-4
   warmup_steps: 1000
-  grad_clip: 1.0 
+  grad_clip: 1.0
+  optimizer:
+    name: "sgd"  # Options: adamw, adam, sgd, adafactor
+    memory_efficient: true
+  mixed_precision: true  # Enable automatic mixed precision
+  gradient_checkpointing: true  # Enable gradient checkpointing 
