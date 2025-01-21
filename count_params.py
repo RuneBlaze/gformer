@@ -11,12 +11,9 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", type=str, required=True, help="Path to model config YAML"
-    )
+    parser.add_argument("--config", type=str, required=True, help="Path to model config YAML")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,4 +21,4 @@ if __name__ == "__main__":
     model = TreeTransformer(config).to(device)
     total_params, trainable_params = count_parameters(model)
     print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}") 
