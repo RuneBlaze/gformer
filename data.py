@@ -3,7 +3,7 @@ import json
 import random
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -13,7 +13,7 @@ from rich.console import Console
 from torch.utils.data import Dataset
 
 from constants import MAX_GTREES
-from tokenizer import NewickTokenizer
+from tokenizer import NewickTokenizer, GeneTreeTokenizer
 
 console = Console()
 
@@ -24,7 +24,7 @@ class InputPair:
     stree: str
 
     @staticmethod
-    def tokenize_tree(newick_str: str, tokenizer: NewickTokenizer) -> torch.Tensor:
+    def tokenize_tree(newick_str: str, tokenizer: Union[NewickTokenizer, GeneTreeTokenizer]) -> torch.Tensor:
         """
         Tokenize a single Newick format tree string using the provided tokenizer.
         """
@@ -74,7 +74,8 @@ class TreeDataset(Dataset):
         """
         self.max_sequence_length = max_sequence_length
         self.data: List[InputPair] = []
-        self.tokenizer = NewickTokenizer()
+        self.stree_tokenizer = NewickTokenizer()
+        self.gtree_tokenizer = GeneTreeTokenizer()
         self.cached_encodings = []
         self.num_workers = min(num_workers, cpu_count())
 
@@ -142,32 +143,32 @@ class TreeDataset(Dataset):
 
     def encode_trees(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode both gene trees and species tree using the tokenizer.
+        Encode both gene trees and species tree using their respective tokenizers.
         """
-        # Tokenize each gene tree
+        # Tokenize each gene tree using GeneTreeTokenizer
         gene_tree_tokens = []
         max_length = 0
         for tree in pair.gtrees:
-            tokens = InputPair.tokenize_tree(tree, self.tokenizer)
+            tokens = InputPair.tokenize_tree(tree, self.gtree_tokenizer)
             gene_tree_tokens.append(tokens)
             max_length = max(max_length, len(tokens))
 
-        # Pad gene tree tokens to max length
+        # Pad gene tree tokens to max length using GeneTreeTokenizer's PAD token
         padded_gene_trees = []
         for tokens in gene_tree_tokens:
-            padding = torch.full((max_length - len(tokens),), self.tokenizer.PAD)
+            padding = torch.full((max_length - len(tokens),), self.gtree_tokenizer.PAD)
             padded = torch.cat([tokens, padding])
             padded_gene_trees.append(padded)
 
         # Stack gene trees into a single tensor
         gene_trees_tensor = torch.stack(padded_gene_trees, dim=0)
 
-        # Tokenize species tree
-        species_tokens = torch.tensor(self.tokenizer.encode(pair.stree))
+        # Tokenize species tree using NewickTokenizer
+        species_tokens = torch.tensor(self.stree_tokenizer.encode(pair.stree))
         species_tokens = torch.cat(
             [
                 species_tokens,
-                torch.tensor([self.tokenizer.EOS]),
+                torch.tensor([self.stree_tokenizer.EOS]),
             ]
         )
 
@@ -209,10 +210,10 @@ class TreeDataset(Dataset):
         # Get actual number of trees
         num_gene_trees = min(gene_trees_tensor.size(0), MAX_GTREES)
 
-        # Create padded tensor with PAD tokens
+        # Create padded tensor with PAD tokens from GeneTreeTokenizer
         padded_gene_trees = torch.full(
             (MAX_GTREES, gene_trees_tensor.size(1)),
-            self.tokenizer.PAD,
+            self.gtree_tokenizer.PAD,  # Use GeneTreeTokenizer's PAD token
             dtype=torch.long,
         )
 
@@ -297,5 +298,5 @@ if __name__ == "__main__":
         console.print(f"Species tokens shape: {species_tokens.shape}")
         console.print(f"First few species tokens: {species_tokens[:10]}")
         console.print(f"Gene trees tensor: {gene_trees_tensor[:, :10]}")
-        decoded_stree = dataset_to_inspect.tokenizer.decode(species_tokens.tolist())
+        decoded_stree = dataset_to_inspect.stree_tokenizer.decode(species_tokens.tolist())
         console.print(f"Decoded species tree: {decoded_stree}")
