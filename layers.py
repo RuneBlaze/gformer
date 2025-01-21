@@ -1,7 +1,6 @@
 import math
 from dataclasses import dataclass
 
-import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,11 +36,11 @@ class DistanceMatrixMLP(nn.Module):
             output_dim: Number of output features
         """
         super().__init__()
-        
+
         # Calculate input dimension based on number of taxa
         num_distances = (num_taxa * (num_taxa - 1)) // 2
         input_dim = 8 * num_distances  # 8 is binary distance encoding dimension
-        
+
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
@@ -91,6 +90,65 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[start_pos : start_pos + x.size(1)]
 
 
+class GeneTreeEncoder(nn.Module):
+    """
+    Light-weight encoder-only model to project individual gene trees to a fixed dimension.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int = EMBEDDING_DIM,
+        num_heads: int = 4,
+        num_layers: int = 4,
+    ):
+        super().__init__()
+
+        # Token embedding layer
+        self.token_embedding = nn.Embedding(VOCAB_SIZE, embedding_dim)
+
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(embedding_dim, MAX_SEQUENCE_LENGTH)
+
+        # Encoder layers - using fewer layers than full transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=embedding_dim * 4,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Global pooling to get fixed dimension output
+        self.pooling = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim), nn.LayerNorm(embedding_dim)
+        )
+
+    def forward(self, gene_tree_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            gene_tree_tokens: Tensor of shape [batch_size, max_tree_tokens]
+        Returns:
+            Tensor of shape [batch_size, embedding_dim]
+        """
+        # Create padding mask (True indicates positions that should be masked)
+        padding_mask = gene_tree_tokens == PAD
+
+        # Embed and add positional encoding
+        embeddings = self.token_embedding(gene_tree_tokens)
+        embeddings = self.pos_encoding(embeddings)
+
+        # Run through encoder
+        encoded = self.encoder(embeddings, src_key_padding_mask=padding_mask)
+
+        # Global mean pooling (excluding padding tokens)
+        mask = ~padding_mask.unsqueeze(-1)
+        pooled = (encoded * mask).sum(dim=1) / mask.sum(dim=1)
+
+        # Final projection
+        return self.pooling(pooled)
+
+
 @dataclass
 class ModelConfig:
     embedding_dim: int
@@ -110,25 +168,35 @@ class ModelConfig:
 class TreeTransformer(nn.Module):
     """
     Encoder-decoder transformer model for processing gene trees and generating species trees.
+    Both gene trees and species trees are tokenized using the same vocabulary.
+    First encodes each gene tree to a fixed-dimension vector using GeneTreeEncoder,
+    then processes these encodings to generate the species tree.
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
 
-        # Token embedding layer
-        self.token_embedding = nn.Embedding(VOCAB_SIZE, config.embedding_dim)
-
-        # Tree embedding MLP
-        self.tree_embedding = DistanceMatrixMLP(
-            num_taxa=MAX_TAXA,  # Use MAX_TAXA from constants
-            hidden_dim=config.embedding_dim * 2,
-            output_dim=config.embedding_dim,
+        # Gene tree encoder for processing individual trees
+        self.gene_tree_encoder = GeneTreeEncoder(
+            embedding_dim=config.embedding_dim,
+            num_heads=config.num_heads,
+            num_layers=2,  # Using fewer layers for individual tree encoding
         )
 
-        # Positional encoding
-        self.pos_encoding = PositionalEncoding(config.embedding_dim, config.max_sequence_length)
+        # Token embedding layer (for species tree only)
+        self.token_embedding = nn.Embedding(VOCAB_SIZE, config.embedding_dim)
 
-        # Encoder layers
+        # Positional encoding (for species tree only)
+        self.pos_encoding = PositionalEncoding(
+            config.embedding_dim, config.max_sequence_length
+        )
+
+        # Project gene tree encodings to the right dimension if needed
+        self.gene_tree_projection = nn.Linear(
+            config.embedding_dim, config.embedding_dim
+        )
+
+        # Encoder layers (processes encoded gene trees)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.embedding_dim,
             nhead=config.num_heads,
@@ -136,7 +204,9 @@ class TreeTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.num_layers
+        )
 
         # Decoder layers
         decoder_layer = nn.TransformerDecoderLayer(
@@ -146,7 +216,9 @@ class TreeTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=config.num_layers
+        )
 
         # Output projection
         self.output_projection = nn.Linear(config.embedding_dim, VOCAB_SIZE)
@@ -163,38 +235,37 @@ class TreeTransformer(nn.Module):
 
     def forward(
         self,
-        tree_encodings: torch.Tensor,  # [batch_size, num_gene_trees, num_distances, 8]
+        gene_tree_tokens: torch.Tensor,  # [batch_size, num_gene_trees, max_tree_tokens]
         output_tokens: torch.Tensor = None,  # [batch_size, seq_len]
         attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
+        batch_size, num_gene_trees, max_tree_tokens = gene_tree_tokens.shape
 
-        
+        # Create padding mask for gene trees (True indicates positions that should be masked)
+        gene_tree_padding_mask = gene_tree_tokens == PAD
 
-        # Reshape tree encodings to process each gene tree through MLP
-        tree_encodings = einops.rearrange(
-            tree_encodings,
-            'b g d bits -> (b g) (d bits)',
-            bits=8
-        )
-        encoded_trees = self.tree_embedding(tree_encodings)
-        
-        # Reshape back for encoder input
-        encoder_input = einops.rearrange(
-            encoded_trees,
-            '(b g) e -> b g e',
-            b=batch_size,
-            g=num_gene_trees
-        )
+        # First encode each gene tree individually
+        # Reshape to process all trees at once
+        flat_gene_trees = gene_tree_tokens.view(-1, max_tree_tokens)
 
-        # Create padding mask based on zero vectors
-        # True indicates positions that should be masked (padded)
-        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(batch_size, num_gene_trees)
+        # Encode each gene tree to a fixed-dimension vector
+        gene_tree_encodings = self.gene_tree_encoder(flat_gene_trees)
 
-        # Run Transformer encoder
+        # Reshape back to [batch_size, num_gene_trees, embedding_dim]
+        gene_tree_encodings = gene_tree_encodings.view(batch_size, num_gene_trees, -1)
+
+        # Project encodings if needed
+        gene_tree_encodings = self.gene_tree_projection(gene_tree_encodings)
+
+        # Create padding mask for encoded gene trees
+        # If any position in the original gene tree was all padding, mask that tree's encoding
+        trees_padding_mask = gene_tree_padding_mask.all(
+            dim=-1
+        )  # [batch_size, num_gene_trees]
+
+        # Run main encoder on the gene tree encodings with padding mask
         memory = self.encoder(
-            encoder_input,
-            src_key_padding_mask=tree_padding_mask
+            gene_tree_encodings, src_key_padding_mask=trees_padding_mask
         )
 
         if output_tokens is not None:
@@ -213,17 +284,10 @@ class TreeTransformer(nn.Module):
             # Use gradient checkpointing if enabled
             if self.gradient_checkpointing and self.training:
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    self.decoder,
-                    decoder_input,
-                    memory,
-                    attention_mask
+                    self.decoder, decoder_input, memory, attention_mask
                 )
             else:
-                hidden_states = self.decoder(
-                    decoder_input,
-                    memory,
-                    attention_mask
-                )
+                hidden_states = self.decoder(decoder_input, memory, attention_mask)
         else:
             # Inference mode - start with memory
             hidden_states = memory
