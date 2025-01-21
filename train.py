@@ -1,26 +1,27 @@
 import argparse
 import logging
+import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-import os
 import torch.nn.functional as F
+import treeswift as ts
+import yaml
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import math
-import yaml
-import treeswift as ts
-from torch.cuda.amp import autocast, GradScaler
+
 try:
     from transformers.optimization import Adafactor
     HAVE_ADAFACTOR = True
 except ImportError:
     HAVE_ADAFACTOR = False
 
-from layers import TreeTransformer, ModelConfig
-from constants import VOCAB_SIZE, EOS, PAD
+from constants import EOS, PAD, VOCAB_SIZE
 from data import TreeDataset
+from layers import ModelConfig, TreeTransformer
 from tokenizer import NewickTokenizer
 
 

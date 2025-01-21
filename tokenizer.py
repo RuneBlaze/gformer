@@ -1,6 +1,7 @@
 from typing import List, Union
 
-from constants import INTERNAL_NODE, EOS, PAD, VOCAB_SIZE
+from constants import EOS, INTERNAL_NODE, PAD, VOCAB_SIZE
+
 
 class NewickTokenizer:
     """

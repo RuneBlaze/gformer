@@ -1,11 +1,13 @@
-from data import InputPair
-from smallperm import PseudoRandomPermutation as PRP
-import treeswift as ts
-from typing import List, Set, Dict
-import typer
-from pathlib import Path
-import pandas as pd
 import random
+from pathlib import Path
+from typing import Dict, List, Set
+
+import pandas as pd
+import treeswift as ts
+import typer
+from smallperm import PseudoRandomPermutation as PRP
+
+from data import InputPair
 
 # One-time pad constant for seed modification
 OTP: int = 1000000007

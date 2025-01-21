@@ -1,19 +1,21 @@
+import argparse
 import json
+import random
 from dataclasses import dataclass
+from multiprocessing import Pool, cpu_count
 from typing import List, Tuple
+
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
 import treeswift as ts
-from rich.progress import track
-from rich.console import Console
 from rich import print as rprint
-import argparse
-import pyarrow.parquet as pq
-import random
-from multiprocessing import Pool, cpu_count
-from constants import MAX_TAXA, MAX_GTREES, PAD
+from rich.console import Console
+from rich.progress import track
+from torch.utils.data import Dataset
+
+from constants import MAX_GTREES, MAX_TAXA, PAD
 from tokenizer import NewickTokenizer
 
 console = Console()

@@ -1,25 +1,24 @@
 import math
+from dataclasses import dataclass
 
+import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 import yaml
-import einops
-
 
 from constants import (
-    MAX_TAXA,
-    VOCAB_SIZE,
     EMBEDDING_DIM,
+    EOS,
+    INTERNAL_NODE,
+    MAX_SEQUENCE_LENGTH,
+    MAX_TAXA,
+    MLP_HIDDEN_DIM,
     NUM_HEADS,
     NUM_LAYERS,
-    MLP_HIDDEN_DIM,
-    TREE_EMBEDDING_DIM,
-    MAX_SEQUENCE_LENGTH,
-    INTERNAL_NODE,
-    EOS,
     PAD,
+    TREE_EMBEDDING_DIM,
+    VOCAB_SIZE,
 )
 
 

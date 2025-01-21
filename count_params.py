@@ -1,6 +1,9 @@
 import argparse
+
 import torch
-from layers import TreeTransformer, ModelConfig
+
+from layers import ModelConfig, TreeTransformer
+
 
 def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     """Count total and trainable parameters in the model"""
