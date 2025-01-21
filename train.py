@@ -18,8 +18,10 @@ try:
 except ImportError:
     HAVE_ADAFACTOR = False
 
-from layers import END_OF_INPUT, END_OF_OUTPUT, VOCAB_SIZE, TreeTransformer, ModelConfig
+from layers import TreeTransformer, ModelConfig
+from constants import VOCAB_SIZE, EOS, PAD
 from data import TreeDataset
+from tokenizer import NewickTokenizer
 
 
 def encode_distance_matrix(distance_matrix: np.ndarray) -> torch.Tensor:
@@ -179,16 +181,16 @@ def train_epoch(
     epoch: int,
     scaler: GradScaler = None,
     mixed_precision: bool = False,
+    gradient_accumulation_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0
+    optimizer.zero_grad()
 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch_idx, (tree_encodings, target_seq) in enumerate(progress_bar):
         tree_encodings = tree_encodings.to(device)
         target_seq = target_seq.to(device)
-
-        optimizer.zero_grad()
         
         # Use automatic mixed precision if enabled
         with autocast(enabled=mixed_precision):
@@ -199,28 +201,47 @@ def train_epoch(
                 attention_mask=None  # Will be auto-generated
             )
 
+            # Print shapes to understand the parallel processing
+            # print("Input sequence shape:", target_seq[:, :-1].shape)
+            # print("Output logits shape:", logits.shape)
+            # print("Target sequence shape:", target_seq[:, 1:].shape)
+            
+            # # First sequence in batch
+            # print("\nFirst sequence:")
+            # print("Input:", target_seq[0, :-1])  # Input sequence
+            # print("Target:", target_seq[0, 1:])  # Expected predictions
+
             # Compute loss
             loss = F.cross_entropy(
                 logits.reshape(-1, VOCAB_SIZE),
                 target_seq[:, 1:].reshape(-1),
-                ignore_index=END_OF_INPUT,
+                ignore_index=PAD,
             )
+            # Scale loss by accumulation steps
+            loss = loss / gradient_accumulation_steps
 
         # Backward pass with mixed precision support
         if mixed_precision and scaler is not None:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
 
-        scheduler.step()
-        total_loss += loss.item()
-        progress_bar.set_postfix({"loss": loss.item()})
+        # Update weights if we've accumulated enough gradients
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            if mixed_precision and scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            
+            optimizer.zero_grad()
+            scheduler.step()
+
+        total_loss += loss.item() * gradient_accumulation_steps
+        progress_bar.set_postfix({"loss": loss.item() * gradient_accumulation_steps})
 
     return total_loss / len(dataloader)
 
@@ -228,7 +249,7 @@ def train_epoch(
 def compute_tree_accuracy(predicted_tokens: torch.Tensor, target_tokens: torch.Tensor) -> float:
     """Compute accuracy of tree topology prediction"""
     # Ignore padding tokens in comparison
-    mask = target_tokens != END_OF_INPUT  # Using constant from layers module
+    mask = target_tokens != EOS  # Updated from END_OF_INPUT
     correct = (predicted_tokens == target_tokens) & mask
     return correct.float().sum() / mask.sum()
 
@@ -255,15 +276,18 @@ def validate(model, val_loader, device) -> dict:
             # Evaluate each position in sequence
             for pos in range(1, seq_length):
                 partial_target = target_seq[:, :pos]
-                attention_mask = create_causal_mask(
-                    pos + num_trees, num_trees, device
-                )
+                attention_mask = torch.triu(torch.ones(pos, pos), diagonal=1).bool().to(device)
+
 
                 logits = model(
                     tree_encodings=tree_encodings,
                     output_tokens=partial_target,
                     attention_mask=attention_mask,
                 )
+
+                print(logits.shape)
+
+                print(F.softmax(logits, dim=-1))
 
                 # Loss for next token prediction
                 loss = F.cross_entropy(
@@ -304,6 +328,8 @@ class TrainingConfig:
     optimizer: dict
     mixed_precision: bool
     gradient_checkpointing: bool
+    gradient_accumulation_steps: int
+    save_interval: int
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "TrainingConfig":
@@ -318,8 +344,77 @@ class TrainingConfig:
             grad_clip=float(training_config["grad_clip"]),
             optimizer=training_config["optimizer"],
             mixed_precision=training_config.get("mixed_precision", False),
-            gradient_checkpointing=training_config.get("gradient_checkpointing", False)
+            gradient_checkpointing=training_config.get("gradient_checkpointing", False),
+            gradient_accumulation_steps=int(training_config.get("gradient_accumulation_steps", 1)),
+            save_interval=int(training_config.get("save_interval", 1))
         )
+
+
+def show_example_completions(model, val_loader, device, tokenizer, num_examples=5) -> None:
+    """Show example completions from the model"""
+    model.eval()
+    
+    with torch.no_grad():
+        # Get a batch of data
+        tree_encodings, target_seq = next(iter(val_loader))
+        tree_encodings = tree_encodings.to(device)
+        target_seq = target_seq.to(device)
+        
+        # Show completions for first num_examples in batch
+        for i in range(min(num_examples, target_seq.size(0))):
+            # Get ground truth completion
+            gt_completion = tokenizer.decode(target_seq[i].cpu().tolist())
+            
+            # Start with just first token (usually INTERNAL_NODE)
+            curr_seq = target_seq[i:i+1, :1]  
+            
+            # Generate tokens until we hit EOS or max length
+            for pos in range(target_seq.size(1) - 1):
+                # Create causal mask for current sequence length
+                attention_mask = torch.triu(
+                    torch.ones(curr_seq.size(1), curr_seq.size(1)), 
+                    diagonal=1
+                ).bool().to(device)
+                
+                # Get next token prediction
+                logits = model(
+                    tree_encodings=tree_encodings[i:i+1],  # Keep batch dimension
+                    output_tokens=curr_seq,
+                    attention_mask=attention_mask
+                )
+                
+                # Get most likely next token
+                next_token = logits[:, -1:, :].argmax(dim=-1)
+                
+                # Break if we hit EOS
+                if next_token.item() == tokenizer.EOS:
+                    break
+                    
+                # Add predicted token to sequence
+                curr_seq = torch.cat([curr_seq, next_token], dim=1)
+            
+            # Decode prediction
+            pred_completion = tokenizer.decode(curr_seq[0].cpu().tolist())
+            
+            # Print comparison
+            print(f"\nExample {i+1}:")
+            print(f"Ground truth: {gt_completion}")
+            print(f"Prediction:   {pred_completion}")
+            
+            # Print first few logits for debugging
+            if pos == 0:
+                probs = F.softmax(logits[0, 0], dim=-1)
+                top_k = 5
+                values, indices = probs.topk(top_k)
+                print("\nTop predictions for first position:")
+                for prob, idx in zip(values, indices):
+                    if idx == tokenizer.INTERNAL_NODE:
+                        token_name = "INTERNAL_NODE"
+                    elif idx == tokenizer.EOS:
+                        token_name = "EOS"
+                    else:
+                        token_name = str(idx.item())
+                    print(f"{token_name}: {prob:.3f}")
 
 
 def main():
@@ -372,6 +467,16 @@ def main():
                        help='Random seed for reproducibility')
     train_parser.add_argument('--num-workers', type=int, default=4,
                        help='Number of processes for parallel preprocessing')
+    train_parser.add_argument(
+        '--gradient-accumulation-steps', 
+        type=int,
+        help='Number of gradient accumulation steps (overrides config file)'
+    )
+    train_parser.add_argument(
+        '--save-interval',
+        type=int,
+        help='Save checkpoint every N epochs (overrides config file)'
+    )
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser('count-params', help='Count model parameters')
@@ -443,14 +548,14 @@ def main():
             train_dataset, 
             batch_size=batch_size,  # Use the resolved batch_size
             shuffle=True, 
-            num_workers=args.num_workers
+            num_workers=1
         )
 
         val_loader = DataLoader(
             val_dataset, 
             batch_size=batch_size,  # Use the resolved batch_size
             shuffle=False, 
-            num_workers=args.num_workers
+            num_workers=1
         )
 
         # Enable gradient checkpointing if configured
@@ -471,29 +576,48 @@ def main():
             warmup_steps=warmup_steps
         )
 
+        # Use command line value if provided, otherwise use config value
+        grad_accum_steps = (
+            args.gradient_accumulation_steps or 
+            training_config.gradient_accumulation_steps
+        )
+
+        # Adjust total steps for scheduler to account for gradient accumulation
+        total_steps = (len(train_loader) // grad_accum_steps) * args.epochs
+        scheduler = get_scheduler(
+            optimizer,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps
+        )
+
+        # Use command line value if provided, otherwise use config value
+        save_interval = args.save_interval or training_config.save_interval
+
+        # Get tokenizer for showing completions
+        tokenizer = NewickTokenizer()
+
         # Training loop
         best_val_loss = float("inf")
         for epoch in range(args.epochs):
             train_loss = train_epoch(
-                model, 
-                train_loader,
+                model,
+                train_loader, 
                 optimizer,
                 scheduler,
                 device,
                 epoch,
                 scaler=scaler,
-                mixed_precision=training_config.mixed_precision
+                mixed_precision=training_config.mixed_precision,
+                gradient_accumulation_steps=grad_accum_steps
             )
             logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
 
-            # Validate
-            val_metrics = validate(model, val_loader, device)
-            logger.info(f"Epoch {epoch} - Validation loss: {val_metrics['loss']:.4f}")
-            logger.info(f"Epoch {epoch} - Validation accuracy: {val_metrics['accuracy']:.4f}")
+            # Show example completions instead of validation metrics
+            logger.info("Example completions:")
+            show_example_completions(model, val_loader, device, tokenizer)
 
-            # Save checkpoint if validation loss improved
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+            # Save checkpoint if we've hit the save interval
+            if save_interval > 0 and (epoch + 1) % save_interval == 0:
                 checkpoint_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pt")
                 torch.save(
                     {
@@ -501,8 +625,6 @@ def main():
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "train_loss": train_loss,
-                        "val_loss": val_metrics['loss'],
-                        "val_accuracy": val_metrics['accuracy'],
                     },
                     checkpoint_path,
                 )

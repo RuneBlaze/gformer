@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 import yaml
+import einops
 
 
 from constants import (
@@ -16,27 +17,32 @@ from constants import (
     MLP_HIDDEN_DIM,
     TREE_EMBEDDING_DIM,
     MAX_SEQUENCE_LENGTH,
-    LEFT_PAREN,
-    RIGHT_PAREN,
-    END_OF_INPUT,
-    END_OF_OUTPUT,
+    INTERNAL_NODE,
+    EOS,
+    PAD,
 )
 
 
 class DistanceMatrixMLP(nn.Module):
     """
     Single hidden layer MLP with SiLU activation for processing distance matrix encodings.
+    Input dimension is calculated as: 8 * (n*(n-1)/2) where n is number of taxa
+    and 8 is the binary distance encoding dimension.
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+    def __init__(self, num_taxa: int, hidden_dim: int, output_dim: int):
         """
         Args:
-            input_dim: Number of input features (8 for binary distance encoding)
+            num_taxa: Number of taxa in the tree
             hidden_dim: Size of the hidden layer
             output_dim: Number of output features
         """
         super().__init__()
-
+        
+        # Calculate input dimension based on number of taxa
+        num_distances = (num_taxa * (num_taxa - 1)) // 2
+        input_dim = 8 * num_distances  # 8 is binary distance encoding dimension
+        
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
@@ -94,7 +100,6 @@ class ModelConfig:
     mlp_hidden_dim: int
     tree_embedding_dim: int
     max_sequence_length: int
-    vocab_size: int
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ModelConfig":
@@ -112,13 +117,13 @@ class TreeTransformer(nn.Module):
         super().__init__()
 
         # Token embedding layer
-        self.token_embedding = nn.Embedding(config.vocab_size, config.embedding_dim)
+        self.token_embedding = nn.Embedding(VOCAB_SIZE, config.embedding_dim)
 
         # Tree embedding MLP
         self.tree_embedding = DistanceMatrixMLP(
-            input_dim=8,  # Binary distance encoding dimension
+            num_taxa=MAX_TAXA,  # Use MAX_TAXA from constants
             hidden_dim=config.embedding_dim * 2,
-            output_dim=config.embedding_dim,  # Must match embedding_dim for transformer
+            output_dim=config.embedding_dim,
         )
 
         # Positional encoding
@@ -145,7 +150,7 @@ class TreeTransformer(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
 
         # Output projection
-        self.output_projection = nn.Linear(config.embedding_dim, config.vocab_size)
+        self.output_projection = nn.Linear(config.embedding_dim, VOCAB_SIZE)
 
         # Enable support for gradient checkpointing
         self.gradient_checkpointing = False
@@ -159,45 +164,43 @@ class TreeTransformer(nn.Module):
 
     def forward(
         self,
-        tree_encodings: torch.Tensor,  # [batch_size, max_taxa, input_dim]
+        tree_encodings: torch.Tensor,  # [batch_size, num_gene_trees, num_distances, 8]
         output_tokens: torch.Tensor = None,  # [batch_size, seq_len]
         attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Forward pass through the model.
+        batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
 
-        Args:
-            tree_encodings: Tensor containing distance matrix encodings for each tree
-            output_tokens: Target sequence tokens (for training)
-            attention_mask: Causal attention mask for decoder self-attention
-
-        Returns:
-            torch.Tensor: Output logits of shape [batch_size, seq_len, vocab_size]
-        """
-        batch_size = tree_encodings.size(0)
-        max_taxa = tree_encodings.size(1)
-
-        # Create padding mask for trees (1 for real data, 0 for padding)
-        # We assume zero vectors are padding
-        tree_padding_mask = (tree_encodings.sum(dim=-1) != 0).any(dim=-1)  # [batch_size, max_taxa]
         
-        # Embed trees using MLP
-        tree_embeddings = self.tree_embedding(
-            tree_encodings.view(-1, tree_encodings.size(-1))
-        )
-        encoder_input = tree_embeddings.view(batch_size, max_taxa, -1)
 
-        # Run encoder with padding mask
+        # Reshape tree encodings to process each gene tree through MLP
+        tree_encodings = einops.rearrange(
+            tree_encodings,
+            'b g d bits -> (b g) (d bits)',
+            bits=8
+        )
+        encoded_trees = self.tree_embedding(tree_encodings)
+        
+        # Reshape back for encoder input
+        encoder_input = einops.rearrange(
+            encoded_trees,
+            '(b g) e -> b g e',
+            b=batch_size,
+            g=num_gene_trees
+        )
+
+        # Create padding mask based on zero vectors
+        # True indicates positions that should be masked (padded)
+        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(batch_size, num_gene_trees)
+
+        # Run Transformer encoder
         memory = self.encoder(
             encoder_input,
-            src_key_padding_mask=~tree_padding_mask  # PyTorch expects True for padding positions
+            src_key_padding_mask=tree_padding_mask
         )
 
         if output_tokens is not None:
             # Training mode
             token_embeddings = self.token_embedding(output_tokens)
-            
-            # Add positional encoding to decoder input
             decoder_input = self.pos_encoding(token_embeddings)
 
             # Generate causal mask if not provided
@@ -222,9 +225,8 @@ class TreeTransformer(nn.Module):
                     memory,
                     attention_mask
                 )
-
         else:
-            # Inference mode - start with just embedding of first token
+            # Inference mode - start with memory
             hidden_states = memory
 
         # Project to vocabulary

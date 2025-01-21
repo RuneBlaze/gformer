@@ -1,111 +1,120 @@
 from typing import List, Union
 
-import torch
-
+from constants import INTERNAL_NODE, EOS, PAD, VOCAB_SIZE
 
 class NewickTokenizer:
     """
-    Tokenizer for Newick tree strings with taxa labels 0-255.
-
-    Special tokens:
-    - LEFT_PAREN: (
-    - RIGHT_PAREN: )
-    - EOI: End of input
-    - EOS: End of sequence
+    Grammar-based tokenizer for Newick tree strings with taxa labels 0-255.
+    This tokenizer emits tokens for internal nodes and leaves following a pre-order traversal.
     """
 
-    # Special token values (placed after taxa labels 0-255)
-    LEFT_PAREN = 256
-    RIGHT_PAREN = 257
-    EOI = 258  # End of input
-    EOS = 259  # End of sequence
+    INTERNAL_NODE = INTERNAL_NODE
+    EOS = EOS
+    PAD = PAD  # Add PAD token constant
 
     def __init__(self):
-        self.vocab_size = 260  # 256 taxa + 4 special tokens
+        self.vocab_size = VOCAB_SIZE  # Use VOCAB_SIZE from constants.py
 
     def encode(self, newick_str: str) -> List[int]:
         """
-        Encode a Newick tree string into a list of token IDs.
+        Encode a Newick tree string into a list of tokens using a grammar-based approach.
 
         Args:
-            newick_str: A Newick format tree string (e.g., "(0,(1,2))")
+            newick_str: A Newick format tree string (e.g., "(1,(2,3));")
 
         Returns:
-            List of integer token IDs
+            List of integer tokens
         """
-        tokens = []
-        current_number = ""
+        def parse_subtree(index: int) -> (List[int], int):
+            tokens = []
+            if newick_str[index] == "(":
+                tokens.append(self.INTERNAL_NODE)
+                index += 1
+                left_tokens, index = parse_subtree(index)
+                tokens.extend(left_tokens)
+                index += 1  # Skip the comma
+                right_tokens, index = parse_subtree(index)
+                tokens.extend(right_tokens)
+                index += 1  # Skip the closing parenthesis
+            else:
+                # Parse a leaf label
+                number = ""
+                while index < len(newick_str) and newick_str[index].isdigit():
+                    number += newick_str[index]
+                    index += 1
+                tokens.append(int(number))
+            return tokens, index
 
-        for char in newick_str:
-            if char == "(":
-                tokens.append(self.LEFT_PAREN)
-            elif char == ")":
-                if current_number:
-                    tokens.append(int(current_number))
-                    current_number = ""
-                tokens.append(self.RIGHT_PAREN)
-            elif char.isdigit():
-                current_number += char
-            elif char in [",", " "]:
-                if current_number:
-                    tokens.append(int(current_number))
-                    current_number = ""
-
-        # Handle any remaining number
-        if current_number:
-            tokens.append(int(current_number))
-
-        # Validate taxa labels
-        for token in tokens:
-            if isinstance(token, int) and token < 256:
-                if token < 0 or token > 255:
-                    raise ValueError(f"Taxa label {token} out of valid range [0-255]")
-
-        # Add EOS token
-        tokens.append(self.EOS)
+        tokens, index = parse_subtree(0)
+        tokens.append(self.EOS)  # Add EOS token at the end
         return tokens
 
     def decode(self, tokens: List[int]) -> str:
         """
-        Decode a list of token IDs back into a Newick tree string.
+        Decode a list of tokens back into a Newick tree string.
+        Ignores PAD tokens during decoding.
 
         Args:
-            tokens: List of integer token IDs
+            tokens: List of integer tokens
 
         Returns:
             Newick format tree string
         """
-        result = []
-
-        for token in tokens:
-            if token == self.LEFT_PAREN:
-                result.append("(")
-            elif token == self.RIGHT_PAREN:
-                result.append(")")
-            elif token == self.EOS:
-                break
-            elif token == self.EOI:
-                continue
-            elif 0 <= token <= 255:
-                result.append(str(token))
+        def build_subtree(index: int) -> (str, int):
+            # Skip any PAD tokens
+            while index < len(tokens) and tokens[index] == self.PAD:
+                index += 1
+                
+            if index >= len(tokens):
+                return "", index
+                
+            if tokens[index] == self.INTERNAL_NODE:
+                index += 1
+                left_subtree, index = build_subtree(index)
+                right_subtree, index = build_subtree(index)
+                subtree = f"({left_subtree},{right_subtree})"
             else:
-                raise ValueError(f"Invalid token ID: {token}")
+                # Leaf node
+                subtree = str(tokens[index])
+                index += 1
+            return subtree, index
 
-        return ",".join("".join(result).split(","))
+        tree, _ = build_subtree(0)
+        return tree + ";"  # Append the Newick end character
 
-    def encode_batch(self, newick_strings: List[str]) -> torch.Tensor:
+    def encode_batch(self, newick_strings: List[str]) -> List[List[int]]:
         """
-        Encode a batch of Newick strings into a padded tensor.
+        Encode a batch of Newick strings.
 
         Args:
             newick_strings: List of Newick format tree strings
 
         Returns:
-            torch.Tensor: Padded tensor of token IDs
+            List of lists of integer tokens
         """
-        encoded = [self.encode(s) for s in newick_strings]
-        max_len = max(len(s) for s in encoded)
+        return [self.encode(s) for s in newick_strings]
 
-        # Pad with EOI token
-        padded = [s + [self.EOI] * (max_len - len(s)) for s in encoded]
-        return torch.tensor(padded, dtype=torch.long)
+    def decode_batch(self, token_batches: List[List[int]]) -> List[str]:
+        """
+        Decode a batch of token lists.
+
+        Args:
+            token_batches: List of lists of integer tokens
+
+        Returns:
+            List of Newick format tree strings
+        """
+        return [self.decode(tokens) for tokens in token_batches]
+
+
+if __name__ == '__main__':
+    # Example usage
+    stree = "(((1,14),(9,6)),((((15,(0,10)),(5,4)),12),((((7,11),13),(2,8)),3)));"
+    tokenizer = NewickTokenizer()
+    print("Original tree:", stree)
+
+    encoded = tokenizer.encode(stree)
+    print("Encoded tokens:", encoded)
+
+    decoded = tokenizer.decode(encoded)
+    print("Decoded tree:", decoded)

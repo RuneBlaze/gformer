@@ -13,7 +13,7 @@ import argparse
 import pyarrow.parquet as pq
 import random
 from multiprocessing import Pool, cpu_count
-from constants import MAX_TAXA
+from constants import MAX_TAXA, MAX_GTREES, PAD
 from tokenizer import NewickTokenizer
 
 console = Console()
@@ -50,7 +50,6 @@ class InputPair:
             for j, v in enumerate(taxa):
                 if i != j:
                     dist_matrix[i,j] = int(dist_dict[u][v])
-                    
         return dist_matrix
 
 
@@ -69,9 +68,7 @@ def encode_distance_matrix(distance_matrix: np.ndarray) -> torch.Tensor:
         bit_value = (distances & (1 << bit)) >> bit
         binary_encoding[:, :, bit] = bit_value.float()
 
-    binary_encoding = F.silu(binary_encoding)
     flat_encoding = binary_encoding[mask]
-
     return flat_encoding
 
 
@@ -111,22 +108,41 @@ class TreeDataset(Dataset):
         table = pq.read_table(parquet_path)
         df = table.to_pandas()
         
-        # Get unique directories and split them
+        # Get unique directories and check if we have enough for directory-based split
         all_dirs = sorted(df['directory'].unique())
         n_val = int(len(all_dirs) * val_ratio)
-        val_dirs = set(random.sample(all_dirs, n_val))
         
-        # Filter based on split
-        if split == 'train':
-            df = df[~df['directory'].isin(val_dirs)]
-        else:  # val
-            df = df[df['directory'].isin(val_dirs)]
+        if n_val >= 1:
+            # Directory-based split if we have enough directories
+            val_dirs = set(random.sample(all_dirs, n_val))
             
+            # Filter based on split
+            if split == 'train':
+                df = df[~df['directory'].isin(val_dirs)]
+            else:  # val
+                df = df[df['directory'].isin(val_dirs)]
+        else:
+            # Fallback to random row-based split if too few directories
+            all_indices = list(range(len(df)))
+            n_val_samples = int(len(df) * val_ratio)
+            val_indices = set(random.sample(all_indices, n_val_samples))
+            
+            if split == 'train':
+                df = df[~df.index.isin(val_indices)]
+            else:  # val
+                df = df[df.index.isin(val_indices)]
+        
         console.print(f"Loading {split} split with {len(df)} examples")
+
+        import treeswift as ts
+
+        
         
         for _, row in df.iterrows():
+            stree = ts.read_tree_newick(row['species_tree'])
+            stree.order("num_descendants_then_label")
             self.data.append(
-                InputPair(gtrees=row['gtrees'], stree=row['species_tree'])
+                InputPair(gtrees=row['gtrees'], stree=stree.newick().lstrip("[&R] "))
             )
 
     def _load_from_jsonl(self, jsonl_path: str):
@@ -152,7 +168,6 @@ class TreeDataset(Dataset):
         species_tokens = torch.tensor(self.tokenizer.encode(pair.stree))
         species_tokens = torch.cat(
             [
-                torch.tensor([self.tokenizer.EOI]),
                 species_tokens,
                 torch.tensor([self.tokenizer.EOS]),
             ]
@@ -189,9 +204,17 @@ class TreeDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         tree_tensor, species_tokens = self.cached_encodings[idx]
         
-        # Pad tree tensor to max taxa size instead of 512
-        padded_tree_tensor = torch.zeros(MAX_TAXA, tree_tensor.size(1), tree_tensor.size(2))
-        padded_tree_tensor[:tree_tensor.size(0)] = tree_tensor
+        # Get actual number of trees
+        num_gene_trees = min(tree_tensor.size(0), MAX_GTREES)
+        
+        # Create padded tensor directly with zeros
+        padded_tree_tensor = torch.zeros(
+            (MAX_GTREES, tree_tensor.size(1), tree_tensor.size(2)),
+            dtype=torch.float32
+        )
+        
+        # Copy actual tree encodings
+        padded_tree_tensor[:num_gene_trees] = tree_tensor[:num_gene_trees]
         
         return padded_tree_tensor, species_tokens
 
@@ -253,4 +276,8 @@ if __name__ == "__main__":
         console.print(f"\n[cyan]Item {i}:[/cyan]")
         console.print(f"Tree tensor shape: {tree_tensor.shape}")
         console.print(f"Species tokens shape: {species_tokens.shape}")
-        console.print(f"First few species tokens: {species_tokens[:10]}") 
+        console.print(f"First few species tokens: {species_tokens[:10]}")
+        console.print(f"Tree tensor: {tree_tensor[:, :10]}")
+        # Add decoded species tree output
+        decoded_stree = dataset_to_inspect.tokenizer.decode(species_tokens.tolist())
+        console.print(f"Decoded species tree: {decoded_stree}") 
