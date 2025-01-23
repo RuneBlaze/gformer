@@ -14,5 +14,6 @@ training:
   optimizer:
     name: "adamw"  # Options: adamw, adam, sgd, adafactor
     memory_efficient: true
-  mixed_precision: true  # Enable automatic mixed precision
-  gradient_checkpointing: true  # Enable gradient checkpointing 
+  mixed_precision: no  # Enable automatic mixed precision
+  gradient_checkpointing: true  # Enable gradient checkpointing
+  save_interval: 1  # Save checkpoint every epoch

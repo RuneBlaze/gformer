@@ -112,7 +112,7 @@ class NewickTokenizer:
 
 if __name__ == "__main__":
     # Example usage
-    stree = "(((1,14),(9,6)),((((15,(0,10)),(5,4)),12),((((7,11),13),(2,8)),3)));"
+    stree = "((10,13),(((4,9),(2,(11,(12,14)))),((6,(1,(15,5))),(0,(7,(3,8))))));"
     tokenizer = NewickTokenizer()
     print("Original tree:", stree)
 
@@ -121,3 +121,7 @@ if __name__ == "__main__":
 
     decoded = tokenizer.decode(encoded)
     print("Decoded tree:", decoded)
+    print([17, 10, 13, 17, 17, 17, 4, 9, 17, 2, 17, 11, 17, 12, 14, 17, 17, 6, 17, 1, 17, 15, 5, 17, 0, 17, 7, 17, 3, 8])
+    print(tokenizer.decode(
+        [17, 10, 13, 17, 17, 17, 4, 9, 17, 2, 17, 11, 17, 12, 14, 17, 17, 6, 17, 1, 17, 15, 5, 17, 0, 17, 7, 17, 3, 8]
+    ))

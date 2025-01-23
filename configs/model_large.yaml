@@ -6,7 +6,6 @@ model:
   mlp_hidden_dim: 3072  # 4x embedding dim
   tree_embedding_dim: 768
   max_sequence_length: 1024
-  vocab_size: 260  # Unchanged - depends on tokenizer
 
 training:
   batch_size: 32

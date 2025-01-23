@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.3.0",
     "einops>=0.8.0",
     "filelock>=3.16.1",
     "numpy>=2.2.2",
@@ -14,8 +15,11 @@ dependencies = [
     "smallperm>=0.1.12",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
+    "transformers>=4.48.1",
     "treeswift>=1.1.45",
     "typer>=0.15.1",
+    "wandb>=0.19.4",
+    "xxhash>=3.5.0",
 ]
 
 [tool.uv]

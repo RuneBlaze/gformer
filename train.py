@@ -13,6 +13,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from constants import MAX_TAXA, INTERNAL_NODE
 
 try:
     from transformers.optimization import Adafactor
@@ -312,12 +313,14 @@ class TrainingConfig:
     save_interval: int
 
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> "TrainingConfig":
+    def from_yaml(cls, yaml_path: str) -> tuple["TrainingConfig", ModelConfig]:
+        """Load both training and model configs from yaml file"""
         with open(yaml_path) as f:
             config = yaml.safe_load(f)
 
+        # Parse training config
         training_config = config["training"]
-        return cls(
+        train_cfg = cls(
             batch_size=int(training_config["batch_size"]),
             learning_rate=float(training_config["learning_rate"]),
             warmup_steps=int(training_config["warmup_steps"]),
@@ -331,11 +334,16 @@ class TrainingConfig:
             save_interval=int(training_config.get("save_interval", 1)),
         )
 
+        # Parse model config
+        model_cfg = ModelConfig.from_yaml(yaml_path)  # This already handles the "model" section
+
+        return train_cfg, model_cfg
+
 
 def show_example_completions(
     model, val_loader, device, tokenizer, num_examples=5
 ) -> None:
-    """Show example completions from the model"""
+    """Show example completions from the model with constrained generation"""
     model.eval()
 
     with torch.no_grad():
@@ -350,43 +358,62 @@ def show_example_completions(
             gt_completion = tokenizer.decode(target_seq[i].cpu().tolist())
 
             # Start with just first token (usually INTERNAL_NODE)
-            curr_seq = target_seq[i : i + 1, :1]
-
+            curr_seq = target_seq[i:i+1, :1]
+            
+            # Track which taxa have been seen
+            seen_taxa = set()
+            
             # Generate tokens until we hit EOS or max length
-            for pos in range(target_seq.size(1) - 1):
+            for pos in range(512):
                 # Create causal mask for current sequence length
-                attention_mask = (
-                    torch.triu(
-                        torch.ones(curr_seq.size(1), curr_seq.size(1)), diagonal=1
-                    )
-                    .bool()
-                    .to(device)
-                )
+                attention_mask = torch.triu(
+                    torch.ones(curr_seq.size(1), curr_seq.size(1)), diagonal=1
+                ).bool().to(device)
 
                 # Get next token prediction
                 logits = model(
-                    tree_encodings=tree_encodings[i : i + 1],  # Keep batch dimension
+                    tree_encodings=tree_encodings[i:i+1],  # Keep batch dimension
                     output_tokens=curr_seq,
                     attention_mask=attention_mask,
                 )
+                
+                # Get probabilities for next token
+                probs = F.softmax(logits[:, -1:, :], dim=-1)
+                
+                # Modify probabilities based on constraints
+                if len(seen_taxa) < MAX_TAXA:
+                    # Set EOS probability to 0 until all taxa are seen
+                    probs[0, 0, EOS] = 0
+                    
+                    # Set probabilities of seen taxa to 0 to prevent repeats
+                    for taxon in seen_taxa:
+                        probs[0, 0, taxon] = 0
+                    
+                    # Renormalize probabilities
+                    probs = probs / probs.sum()
 
                 # Get most likely next token
-                next_token = logits[:, -1:, :].argmax(dim=-1)
+                next_token = probs.argmax(dim=-1)
+                next_token_val = next_token.item()
 
-                # Break if we hit EOS
-                if next_token.item() == tokenizer.EOS:
+                # Update seen taxa if this is a taxon
+                if 0 <= next_token_val < MAX_TAXA:
+                    seen_taxa.add(next_token_val)
+
+                # Break if we hit EOS and all taxa have been seen
+                if next_token_val == EOS and len(seen_taxa) >= MAX_TAXA:
                     break
 
                 # Add predicted token to sequence
                 curr_seq = torch.cat([curr_seq, next_token], dim=1)
-
-            # Decode prediction
-            pred_completion = tokenizer.decode(curr_seq[0].cpu().tolist())
+            
+            pred_completion = tokenizer.decode([INTERNAL_NODE] + curr_seq[0].cpu().tolist())
 
             # Print comparison
             print(f"\nExample {i + 1}:")
             print(f"Ground truth: {gt_completion}")
             print(f"Prediction:   {pred_completion}")
+            print(f"Taxa seen: {sorted(list(seen_taxa))}")
 
             # Print first few logits for debugging
             if pos == 0:
@@ -466,6 +493,7 @@ def main():
         "--gradient-accumulation-steps",
         type=int,
         help="Number of gradient accumulation steps (overrides config file)",
+        default=1,
     )
     train_parser.add_argument(
         "--save-interval",
@@ -480,6 +508,11 @@ def main():
         type=str,
         default="tree-transformer",
         help="Weights & Biases project name",
+    )
+    train_parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Use mixed precision training (overrides config file)",
     )
 
     # Count parameters subcommand
@@ -506,11 +539,29 @@ def main():
         return
 
     elif args.command == "train":
-        # Initialize accelerator
+        # Load both configs
+        training_config, model_config = TrainingConfig.from_yaml(args.config)
+
+        # Override config values with command line arguments if provided
+        if args.save_interval is not None:
+            training_config.save_interval = args.save_interval
+        if args.lr is not None:
+            training_config.learning_rate = args.lr
+        if args.batch_size is not None:
+            training_config.batch_size = args.batch_size
+        if args.warmup_steps is not None:
+            training_config.warmup_steps = args.warmup_steps
+        if args.grad_clip is not None:
+            training_config.grad_clip = args.grad_clip
+        if args.mixed_precision:
+            training_config.mixed_precision = True
+        if args.gradient_accumulation_steps is not None:
+            training_config.gradient_accumulation_steps = args.gradient_accumulation_steps
+
+        # Initialize accelerator with the proper gradient_accumulation_steps from config
         accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps
-            or args.save_interval,
-            mixed_precision="fp16" if args.mixed_precision else "no",
+            gradient_accumulation_steps=training_config.gradient_accumulation_steps,
+            mixed_precision="fp16" if training_config.mixed_precision else "no",
             log_with="wandb" if args.use_wandb else None,
         )
 
@@ -524,9 +575,8 @@ def main():
         # Create save directory
         os.makedirs(args.save_dir, exist_ok=True)
 
-        # Initialize model
-        config = ModelConfig.from_yaml(args.config)
-        model = TreeTransformer(config)
+        # Initialize model with model config
+        model = TreeTransformer(model_config)
 
         # Create datasets and dataloaders
         train_dataset = TreeDataset(
@@ -547,20 +597,20 @@ def main():
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=args.batch_size or training_config.batch_size,
             shuffle=True,
             num_workers=args.num_workers,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=args.batch_size or training_config.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
         )
 
-        # Initialize optimizer and scheduler
-        optimizer = get_optimizer(model, config)
+        # Use training config for training parameters
+        optimizer = get_optimizer(model, training_config)
 
         # Adjust total steps for scheduler
         total_steps = (
@@ -569,7 +619,7 @@ def main():
         scheduler = get_scheduler(
             optimizer,
             total_steps=total_steps,
-            warmup_steps=args.warmup_steps or config.warmup_steps,
+            warmup_steps=args.warmup_steps or training_config.warmup_steps,
         )
 
         # Prepare everything with accelerator
@@ -582,10 +632,10 @@ def main():
             accelerator.init_trackers(
                 project_name=args.wandb_project,
                 config={
-                    "learning_rate": args.lr or config.learning_rate,
-                    "batch_size": args.batch_size or config.batch_size,
+                    "learning_rate": args.lr or training_config.learning_rate,
+                    "batch_size": args.batch_size or training_config.batch_size,
                     "epochs": args.epochs,
-                    "model_config": config.__dict__,
+                    "model_config": model_config.__dict__,
                 },
             )
 
@@ -624,10 +674,8 @@ def main():
                 )
 
                 # Save checkpoint if needed
-                if args.save_interval > 0 and (epoch + 1) % args.save_interval == 0:
-                    checkpoint_path = os.path.join(
-                        args.save_dir, f"model_epoch_{epoch}.pt"
-                    )
+                if training_config.save_interval > 0 and (epoch + 1) % training_config.save_interval == 0:
+                    checkpoint_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pt")
                     accelerator.save_state(checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
