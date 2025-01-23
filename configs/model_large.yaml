@@ -1,14 +1,20 @@
-# Large model (~200M parameters) for production
 model:
-  embedding_dim: 768  # GPT2-small size
-  num_heads: 12
-  num_layers: 12
-  mlp_hidden_dim: 3072  # 4x embedding dim
-  tree_embedding_dim: 768
+  embedding_dim: 512
+  num_heads: 8
+  num_layers: 8
+  mlp_hidden_dim: 2048
+  tree_embedding_dim: 512
   max_sequence_length: 1024
 
 training:
-  batch_size: 32
+  batch_size: 2
   learning_rate: 1e-4
   warmup_steps: 1000
-  grad_clip: 1.0 
+  grad_clip: 1.0
+  optimizer:
+    name: "adamw"  # Options: adamw, adam, sgd, adafactor
+    memory_efficient: true
+  mixed_precision: no  # Enable automatic mixed precision
+  gradient_checkpointing: true  # Enable gradient checkpointing
+  save_interval: 1  # Save checkpoint every epoch
+  gradient_accumulation_steps: 16
