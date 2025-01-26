@@ -25,6 +25,9 @@ class NewickTokenizer:
 
         Returns:
             List of integer tokens
+
+        Raises:
+            ValueError: If a leaf node value is negative or exceeds the maximum vocabulary size
         """
 
         def parse_subtree(index: int) -> (List[int], int):
@@ -44,7 +47,10 @@ class NewickTokenizer:
                 while index < len(newick_str) and newick_str[index].isdigit():
                     number += newick_str[index]
                     index += 1
-                tokens.append(int(number))
+                leaf_value = int(number)
+                if leaf_value < 0 or leaf_value >= self.vocab_size - 3:  # -3 for INTERNAL_NODE, EOS, and PAD
+                    raise ValueError(f"Leaf value {leaf_value} is outside valid range [0, {self.vocab_size - 4}]")
+                tokens.append(leaf_value)
             return tokens, index
 
         tokens, index = parse_subtree(0)

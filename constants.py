@@ -1,5 +1,5 @@
 # Constants
-MAX_TAXA = 16  # Maximum number of taxa (0-255)
+MAX_TAXA = 32  # Maximum number of taxa (0-255)
 VOCAB_SIZE = MAX_TAXA + 3  # 256 taxa + 2 special tokens (INTERNAL_NODE, EOS)
 EMBEDDING_DIM = 768  # Following GPT2-small
 NUM_HEADS = 12  # Following GPT2-small

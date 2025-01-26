@@ -160,8 +160,6 @@ class TreeTransformer(nn.Module):
     ) -> torch.Tensor:
         batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
 
-        
-
         # Reshape tree encodings to process each gene tree through MLP
         tree_encodings = einops.rearrange(
             tree_encodings,
