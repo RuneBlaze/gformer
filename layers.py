@@ -217,10 +217,8 @@ class RoPETransformerDecoderLayer(nn.Module):
         
         # Self-attention with RoPE
         self.self_attn = RoPEMultiheadAttention(d_model, nhead, max_seq_length)
-        # Regular cross-attention (no RoPE needed)
-        self.multihead_attn = nn.MultiheadAttention(
-            d_model, nhead, batch_first=True
-        )
+        # Cross-attention with RoPE only on query
+        self.cross_attn = RoPEMultiheadAttention(d_model, nhead, max_seq_length)
         
         # Feed-forward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -251,10 +249,12 @@ class RoPETransformerDecoderLayer(nn.Module):
         )
         tgt = tgt + self.dropout(tgt2)
         
-        # Cross-attention block
+        # Cross-attention block with RoPE only on query
         tgt2 = self.norm2(tgt)
-        tgt2, _ = self.multihead_attn(
-            tgt2, memory, memory,
+        tgt2 = self.cross_attn(
+            query=tgt2,  # Will have RoPE applied
+            key=memory,  # No RoPE
+            value=memory,  # No RoPE
             attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask
         )
@@ -356,13 +356,6 @@ class TreeTransformer(nn.Module):
 
         # Enable support for gradient checkpointing
         self.gradient_checkpointing = False
-
-    def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory efficiency"""
-        ...
-        # self.gradient_checkpointing = True
-        # self.encoder.enable_gradient_checkpointing()
-        # self.decoder.enable_gradient_checkpointing()
 
     def forward(
         self,
