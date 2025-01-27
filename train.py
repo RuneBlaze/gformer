@@ -8,8 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import treeswift as ts
-import yaml
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -22,46 +20,10 @@ try:
 except ImportError:
     HAVE_ADAFACTOR = False
 
-from constants import EOS, PAD, VOCAB_SIZE
+from constants import EOS, PAD, VOCAB_SIZE, INTERNAL_NODE, MAX_TAXA
 from data import TreeDataset
-from layers import ModelConfig, TreeTransformer
+from layers import ModelConfig, TreeTransformer, TrainingConfig
 from tokenizer import NewickTokenizer
-
-
-def encode_distance_matrix(distance_matrix: np.ndarray) -> torch.Tensor:
-    """
-    Encode the upper triangular part of a distance matrix (excluding diagonal) into binary representation.
-
-    Args:
-        distance_matrix: NxN numpy array containing uint8 distances
-
-    Returns:
-        torch.Tensor: Binary encoding of shape (num_upper_elements, 8) containing the flattened upper triangular values
-    """
-    N = distance_matrix.shape[0]
-    assert distance_matrix.shape == (N, N), "Input must be a square matrix"
-
-    # Create a mask for upper triangular part (excluding diagonal)
-    mask = torch.triu(torch.ones(N, N), diagonal=1).bool()
-
-    # Convert to torch tensor if not already
-    distances = torch.from_numpy(distance_matrix).to(torch.uint8)
-
-    # Create binary encoding matrix
-    binary_encoding = torch.zeros(N, N, 8, dtype=torch.float32)
-
-    # Get binary representation for each bit position (0-7)
-    for bit in range(8):
-        bit_value = (distances & (1 << bit)) >> bit
-        binary_encoding[:, :, bit] = bit_value.float()
-
-    # Apply SiLU activation to the binary encodings
-    binary_encoding = F.silu(binary_encoding)
-
-    # Extract only the upper triangular elements
-    flat_encoding = binary_encoding[mask]
-
-    return flat_encoding
 
 
 @dataclass
@@ -265,10 +227,6 @@ def validate(model, val_loader, device) -> dict:
                     attention_mask=attention_mask,
                 )
 
-                print(logits.shape)
-
-                print(F.softmax(logits, dim=-1))
-
                 # Loss for next token prediction
                 loss = F.cross_entropy(
                     logits[:, -1, :],
@@ -297,39 +255,6 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
-
-
-@dataclass
-class TrainingConfig:
-    batch_size: int
-    learning_rate: float
-    warmup_steps: int
-    grad_clip: float
-    optimizer: dict
-    mixed_precision: bool
-    gradient_checkpointing: bool
-    gradient_accumulation_steps: int
-    save_interval: int
-
-    @classmethod
-    def from_yaml(cls, yaml_path: str) -> "TrainingConfig":
-        with open(yaml_path) as f:
-            config = yaml.safe_load(f)
-
-        training_config = config["training"]
-        return cls(
-            batch_size=int(training_config["batch_size"]),
-            learning_rate=float(training_config["learning_rate"]),
-            warmup_steps=int(training_config["warmup_steps"]),
-            grad_clip=float(training_config["grad_clip"]),
-            optimizer=training_config["optimizer"],
-            mixed_precision=training_config.get("mixed_precision", False),
-            gradient_checkpointing=training_config.get("gradient_checkpointing", False),
-            gradient_accumulation_steps=int(
-                training_config.get("gradient_accumulation_steps", 1)
-            ),
-            save_interval=int(training_config.get("save_interval", 1)),
-        )
 
 
 def decode_sequence(
@@ -392,44 +317,97 @@ def decode_sequence(
 def show_example_completions(
     model, val_loader, device, tokenizer, num_examples=5
 ) -> None:
-    """Show example completions from the model"""
+    """Show example completions from the model with constrained generation"""
     model.eval()
+    examples_shown = 0
+    val_iter = iter(val_loader)
 
     with torch.no_grad():
-        # Get a batch of data
-        tree_encodings, target_seq = next(iter(val_loader))
-        tree_encodings = tree_encodings.to(device)
-        target_seq = target_seq.to(device)
+        while examples_shown < num_examples:
+            try:
+                # Get next batch
+                tree_encodings, target_seq = next(val_iter)
+            except StopIteration:
+                # Reset iterator if we run out of batches
+                val_iter = iter(val_loader)
+                tree_encodings, target_seq = next(val_iter)
 
-        # Show completions for first num_examples in batch
-        for i in range(min(num_examples, target_seq.size(0))):
-            # Get ground truth completion
-            gt_completion = tokenizer.decode(target_seq[i].cpu().tolist())
+            tree_encodings = tree_encodings.to(device)
+            target_seq = target_seq.to(device)
 
-            # Start with just first token (usually INTERNAL_NODE)
-            curr_seq = target_seq[i : i + 1, :1]
+            # Show completions for examples in batch until we hit num_examples
+            for i in range(min(num_examples - examples_shown, target_seq.size(0))):
+                # Get ground truth completion
+                gt_completion = tokenizer.decode(target_seq[i].cpu().tolist())
 
-            # Generate completion
-            completed_seq = decode_sequence(
-                model, tree_encodings[i : i + 1], curr_seq, device
-            )
+                # Start with just first token (usually INTERNAL_NODE)
+                curr_seq = target_seq[i : i + 1, :1]
 
-            # Decode prediction
-            pred_completion = tokenizer.decode(completed_seq[0].cpu().tolist())
+                # Track which taxa have been seen
+                seen_taxa = set()
 
-            # Print comparison
-            print(f"\nExample {i + 1}:")
-            print(f"Ground truth: {gt_completion}")
-            print(f"Prediction:   {pred_completion}")
-
-            # Print first few logits for debugging
-            if i == 0:  # Only for first example
-                with torch.no_grad():
-                    logits = model(
-                        tree_encodings=tree_encodings[i : i + 1],
-                        output_tokens=curr_seq,
-                        attention_mask=None,
+                # Generate tokens until we hit EOS or max length
+                for pos in range(512):
+                    # Create causal mask for current sequence length
+                    attention_mask = (
+                        torch.triu(
+                            torch.ones(curr_seq.size(1), curr_seq.size(1)), diagonal=1
+                        )
+                        .bool()
+                        .to(device)
                     )
+
+                    # Get next token prediction
+                    logits = model(
+                        tree_encodings=tree_encodings[
+                            i : i + 1
+                        ],  # Keep batch dimension
+                        output_tokens=curr_seq,
+                        attention_mask=attention_mask,
+                    )
+
+                    # Get probabilities for next token
+                    probs = F.softmax(logits[:, -1:, :], dim=-1)
+
+                    # Modify probabilities based on constraints
+                    if len(seen_taxa) < MAX_TAXA:
+                        # Set EOS probability to 0 until all taxa are seen
+                        probs[0, 0, EOS] = 0
+
+                        # Set probabilities of seen taxa to 0 to prevent repeats
+                        for taxon in seen_taxa:
+                            probs[0, 0, taxon] = 0
+
+                        # Renormalize probabilities
+                        probs = probs / probs.sum()
+
+                    # Get most likely next token
+                    next_token = probs.argmax(dim=-1)
+                    next_token_val = next_token.item()
+
+                    # Update seen taxa if this is a taxon
+                    if 0 <= next_token_val < MAX_TAXA:
+                        seen_taxa.add(next_token_val)
+
+                    # Break if we hit EOS and all taxa have been seen
+                    if next_token_val == EOS and len(seen_taxa) >= MAX_TAXA:
+                        break
+
+                    # Add predicted token to sequence
+                    curr_seq = torch.cat([curr_seq, next_token], dim=1)
+
+                pred_completion = tokenizer.decode(
+                    [INTERNAL_NODE] + curr_seq[0].cpu().tolist()
+                )
+
+                # Print comparison
+                print(f"\nExample {examples_shown + 1}:")
+                print(f"Ground truth: {gt_completion}")
+                print(f"Prediction:   {pred_completion}")
+                print(f"Taxa seen: {sorted(list(seen_taxa))}")
+
+                # Print first few logits for debugging
+                if pos == 0:
                     probs = F.softmax(logits[0, 0], dim=-1)
                     top_k = 5
                     values, indices = probs.topk(top_k)
@@ -443,6 +421,10 @@ def show_example_completions(
                             token_name = str(idx.item())
                         print(f"{token_name}: {prob:.3f}")
 
+                examples_shown += 1
+                if examples_shown >= num_examples:
+                    break
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train TreeTransformer model")
@@ -454,44 +436,22 @@ def main():
         "--data", type=str, required=True, help="Path to data file (.jsonl or .parquet)"
     )
     train_parser.add_argument(
-        "--lr", type=float, help="Learning rate (overrides config file)"
+        "--config", type=str, required=True, help="Path to model config YAML"
     )
     train_parser.add_argument(
         "--val-ratio",
         type=float,
         default=0.2,
-        help="Ratio of directories to use for validation (for parquet files)",
-    )
-    train_parser.add_argument(
-        "--config", type=str, required=True, help="Path to model config YAML"
-    )
-    train_parser.add_argument(
-        "--batch-size", type=int, help="Batch size (overrides config file)"
+        help="Ratio of directories to use for validation",
     )
     train_parser.add_argument(
         "--epochs", type=int, default=100, help="Number of epochs"
-    )
-    train_parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to train on",
     )
     train_parser.add_argument(
         "--save-dir",
         type=str,
         default="checkpoints",
         help="Directory to save model checkpoints",
-    )
-    train_parser.add_argument(
-        "--grad-clip",
-        type=float,
-        help="Gradient clipping value (overrides config file)",
-    )
-    train_parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        help="Learning rate warmup steps (overrides config file)",
     )
     train_parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
@@ -502,45 +462,25 @@ def main():
         default=4,
         help="Number of processes for parallel preprocessing",
     )
-    train_parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        help="Number of gradient accumulation steps (overrides config file)",
-    )
-    train_parser.add_argument(
-        "--save-interval",
-        type=int,
-        help="Save checkpoint every N epochs (overrides config file)",
-    )
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser("count-params", help="Count model parameters")
     count_parser.add_argument(
         "--config", type=str, required=True, help="Path to model config YAML"
     )
-    count_parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to initialize model on",
-    )
 
     args = parser.parse_args()
 
-    if args.command == "count-params":
-        device = torch.device(args.device)
-        config = ModelConfig.from_yaml(args.config)
-        model = TreeTransformer(config).to(device)
-        total_params, trainable_params = count_parameters(model)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        return
+    if args.command == "train":
+        # Load configs
+        model_config = ModelConfig.from_yaml(args.config)
+        training_config = TrainingConfig.from_yaml(args.config)
 
-    elif args.command == "train":
-        # Initialize accelerator with gradient accumulation
+        # Initialize accelerator
         accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            mixed_precision="fp16" if args.mixed_precision else "no",
+            gradient_accumulation_steps=training_config.gradient_accumulation_steps,
+            mixed_precision="no",
+            cpu=True,
         )
 
         # Set seed for reproducibility
@@ -557,10 +497,12 @@ def main():
         if accelerator.is_local_main_process:
             os.makedirs(args.save_dir, exist_ok=True)
 
+        # Initialize tokenizer
+        tokenizer = NewickTokenizer()
+
         # Initialize model
         device = accelerator.device
-        config = ModelConfig.from_yaml(args.config)
-        model = TreeTransformer(config)
+        model = TreeTransformer(model_config)
 
         # Create datasets and dataloaders
         train_dataset = TreeDataset(
@@ -581,27 +523,27 @@ def main():
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=training_config.batch_size,
             shuffle=True,
             num_workers=1,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=training_config.batch_size,
             shuffle=False,
             num_workers=1,
         )
 
         # Initialize optimizer and scheduler
-        optimizer = get_optimizer(model, config)
+        optimizer = get_optimizer(model, training_config)
         total_steps = (
-            len(train_loader) // args.gradient_accumulation_steps
+            len(train_loader) // training_config.gradient_accumulation_steps
         ) * args.epochs
         scheduler = get_scheduler(
             optimizer,
             total_steps=total_steps,
-            warmup_steps=args.warmup_steps or config.warmup_steps,
+            warmup_steps=training_config.warmup_steps,
         )
 
         # Prepare everything with accelerator
@@ -628,7 +570,10 @@ def main():
                 show_example_completions(model, val_loader, device, tokenizer)
 
                 # Save checkpoint if we've hit the save interval
-                if args.save_interval > 0 and (epoch + 1) % args.save_interval == 0:
+                if (
+                    training_config.save_interval > 0
+                    and (epoch + 1) % training_config.save_interval == 0
+                ):
                     checkpoint_path = os.path.join(
                         args.save_dir, f"model_epoch_{epoch}.pt"
                     )
@@ -645,6 +590,15 @@ def main():
                         checkpoint_path,
                     )
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+    elif args.command == "count-params":
+        device = torch.device(args.device)
+        config = ModelConfig.from_yaml(args.config)
+        model = TreeTransformer(config).to(device)
+        total_params, trainable_params = count_parameters(model)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        return
 
 
 if __name__ == "__main__":
