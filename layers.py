@@ -29,11 +29,11 @@ class DistanceMatrixMLP(nn.Module):
             output_dim: Number of output features
         """
         super().__init__()
-        
+
         # Calculate input dimension based on number of taxa
         num_distances = (num_taxa * (num_taxa - 1)) // 2
         input_dim = 8 * num_distances  # 8 is binary distance encoding dimension
-        
+
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
@@ -118,7 +118,9 @@ class TreeTransformer(nn.Module):
         )
 
         # Positional encoding
-        self.pos_encoding = PositionalEncoding(config.embedding_dim, config.max_sequence_length)
+        self.pos_encoding = PositionalEncoding(
+            config.embedding_dim, config.max_sequence_length
+        )
 
         # Encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -128,7 +130,9 @@ class TreeTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.num_layers
+        )
 
         # Decoder layers
         decoder_layer = nn.TransformerDecoderLayer(
@@ -138,11 +142,12 @@ class TreeTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=config.num_layers
+        )
 
         # Output projection
         self.output_projection = nn.Linear(config.embedding_dim, VOCAB_SIZE)
-
 
     def forward(
         self,
@@ -153,29 +158,23 @@ class TreeTransformer(nn.Module):
         batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
         # Reshape tree encodings to process each gene tree through MLP
         tree_encodings = einops.rearrange(
-            tree_encodings,
-            'b g d bits -> (b g) (d bits)',
-            bits=8
+            tree_encodings, "b g d bits -> (b g) (d bits)", bits=8
         )
         encoded_trees = self.tree_embedding(tree_encodings)
-        
+
         # Reshape back for encoder input
         encoder_input = einops.rearrange(
-            encoded_trees,
-            '(b g) e -> b g e',
-            b=batch_size,
-            g=num_gene_trees
+            encoded_trees, "(b g) e -> b g e", b=batch_size, g=num_gene_trees
         )
 
         # Create padding mask based on zero vectors
         # True indicates positions that should be masked (padded)
-        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(batch_size, num_gene_trees)
+        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(
+            batch_size, num_gene_trees
+        )
 
         # Run Transformer encoder
-        memory = self.encoder(
-            encoder_input,
-            src_key_padding_mask=tree_padding_mask
-        )
+        memory = self.encoder(encoder_input, src_key_padding_mask=tree_padding_mask)
 
         if output_tokens is not None:
             # Training mode
@@ -193,17 +192,10 @@ class TreeTransformer(nn.Module):
             # Use gradient checkpointing if enabled
             if self.gradient_checkpointing and self.training:
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    self.decoder,
-                    decoder_input,
-                    memory,
-                    attention_mask
+                    self.decoder, decoder_input, memory, attention_mask
                 )
             else:
-                hidden_states = self.decoder(
-                    decoder_input,
-                    memory,
-                    attention_mask
-                )
+                hidden_states = self.decoder(decoder_input, memory, attention_mask)
         else:
             # Inference mode - start with memory
             hidden_states = memory

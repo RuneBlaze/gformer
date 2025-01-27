@@ -211,25 +211,27 @@ def main(
     # Create pool of workers
     with mp.Pool(processes=num_processes) as pool:
         # Prepare arguments for each directory
-        dir_args = [(dir_num, base_dir, target_dimension, num_iterations) 
-                   for dir_num in range(start_dir, end_dir + 1)]
-        
+        dir_args = [
+            (dir_num, base_dir, target_dimension, num_iterations)
+            for dir_num in range(start_dir, end_dir + 1)
+        ]
+
         # Process directories in parallel
         all_results = []
         shard_counter = 0
-        
+
         for batch_results in tqdm(
             pool.imap_unordered(process_directory_wrapper, dir_args),
             total=len(dir_args),
-            desc="Processing directories"
+            desc="Processing directories",
         ):
             all_results.extend(batch_results)
-            
+
             # Write in chunks
             while len(all_results) >= chunk_size:
                 chunk = all_results[:chunk_size]
                 all_results = all_results[chunk_size:]
-                
+
                 # Write chunk to new parquet file
                 df_chunk = pd.DataFrame(chunk)
                 table = pa.Table.from_pandas(df_chunk, schema=schema)

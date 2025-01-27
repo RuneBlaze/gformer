@@ -26,6 +26,7 @@ class NewickTokenizer:
         Returns:
             List of integer tokens
         """
+
         def parse_subtree(index: int) -> (List[int], int):
             tokens = []
             if newick_str[index] == "(":
@@ -61,14 +62,15 @@ class NewickTokenizer:
         Returns:
             Newick format tree string
         """
+
         def build_subtree(index: int) -> (str, int):
             # Skip any PAD tokens
             while index < len(tokens) and tokens[index] == self.PAD:
                 index += 1
-                
+
             if index >= len(tokens):
                 return "", index
-                
+
             if tokens[index] == self.INTERNAL_NODE:
                 index += 1
                 left_subtree, index = build_subtree(index)
@@ -108,7 +110,7 @@ class NewickTokenizer:
         return [self.decode(tokens) for tokens in token_batches]
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Example usage
     stree = "(((1,14),(9,6)),((((15,(0,10)),(5,4)),12),((((7,11),13),(2,8)),3)));"
     tokenizer = NewickTokenizer()
