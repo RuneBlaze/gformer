@@ -202,16 +202,6 @@ def train_epoch(
                 attention_mask=None  # Will be auto-generated
             )
 
-            # Print shapes to understand the parallel processing
-            # print("Input sequence shape:", target_seq[:, :-1].shape)
-            # print("Output logits shape:", logits.shape)
-            # print("Target sequence shape:", target_seq[:, 1:].shape)
-            
-            # # First sequence in batch
-            # print("\nFirst sequence:")
-            # print("Input:", target_seq[0, :-1])  # Input sequence
-            # print("Target:", target_seq[0, 1:])  # Expected predictions
-
             # Compute loss
             loss = F.cross_entropy(
                 logits.reshape(-1, VOCAB_SIZE),
@@ -351,6 +341,62 @@ class TrainingConfig:
         )
 
 
+def decode_sequence(
+    model: TreeTransformer,
+    tree_encodings: torch.Tensor,
+    initial_tokens: torch.Tensor,
+    device: torch.device,
+    max_length: int = None
+) -> torch.Tensor:
+    """
+    Generate a sequence from the model given initial tokens and tree encodings.
+    
+    Args:
+        model: The TreeTransformer model
+        tree_encodings: Tensor of shape [batch_size, num_trees, encoding_dim]
+        initial_tokens: Starting tokens tensor of shape [batch_size, seq_len]
+        device: Device to run generation on
+        max_length: Maximum sequence length (defaults to 2x initial sequence length)
+    
+    Returns:
+        torch.Tensor: Generated sequence of shape [batch_size, seq_len]
+    """
+    model.eval()
+    
+    if max_length is None:
+        max_length = initial_tokens.size(1) * 2
+        
+    curr_seq = initial_tokens
+    
+    with torch.no_grad():
+        # Generate tokens until we hit EOS or max length
+        for pos in range(max_length - initial_tokens.size(1)):
+            # Create causal mask for current sequence length
+            attention_mask = torch.triu(
+                torch.ones(curr_seq.size(1), curr_seq.size(1)), 
+                diagonal=1
+            ).bool().to(device)
+            
+            # Get next token prediction
+            logits = model(
+                tree_encodings=tree_encodings,
+                output_tokens=curr_seq,
+                attention_mask=attention_mask
+            )
+            
+            # Get most likely next token
+            next_token = logits[:, -1:, :].argmax(dim=-1)
+            
+            # Break if we hit EOS
+            if (next_token == EOS).all():
+                break
+                
+            # Add predicted token to sequence
+            curr_seq = torch.cat([curr_seq, next_token], dim=1)
+    
+    return curr_seq
+
+
 def show_example_completions(model, val_loader, device, tokenizer, num_examples=5) -> None:
     """Show example completions from the model"""
     model.eval()
@@ -367,35 +413,18 @@ def show_example_completions(model, val_loader, device, tokenizer, num_examples=
             gt_completion = tokenizer.decode(target_seq[i].cpu().tolist())
             
             # Start with just first token (usually INTERNAL_NODE)
-            curr_seq = target_seq[i:i+1, :1]  
+            curr_seq = target_seq[i:i+1, :1]
             
-            # Generate tokens until we hit EOS or max length
-            for pos in range(target_seq.size(1) - 1):
-                # Create causal mask for current sequence length
-                attention_mask = torch.triu(
-                    torch.ones(curr_seq.size(1), curr_seq.size(1)), 
-                    diagonal=1
-                ).bool().to(device)
-                
-                # Get next token prediction
-                logits = model(
-                    tree_encodings=tree_encodings[i:i+1],  # Keep batch dimension
-                    output_tokens=curr_seq,
-                    attention_mask=attention_mask
-                )
-                
-                # Get most likely next token
-                next_token = logits[:, -1:, :].argmax(dim=-1)
-                
-                # Break if we hit EOS
-                if next_token.item() == tokenizer.EOS:
-                    break
-                    
-                # Add predicted token to sequence
-                curr_seq = torch.cat([curr_seq, next_token], dim=1)
+            # Generate completion
+            completed_seq = decode_sequence(
+                model,
+                tree_encodings[i:i+1],
+                curr_seq,
+                device
+            )
             
             # Decode prediction
-            pred_completion = tokenizer.decode(curr_seq[0].cpu().tolist())
+            pred_completion = tokenizer.decode(completed_seq[0].cpu().tolist())
             
             # Print comparison
             print(f"\nExample {i+1}:")
@@ -403,19 +432,25 @@ def show_example_completions(model, val_loader, device, tokenizer, num_examples=
             print(f"Prediction:   {pred_completion}")
             
             # Print first few logits for debugging
-            if pos == 0:
-                probs = F.softmax(logits[0, 0], dim=-1)
-                top_k = 5
-                values, indices = probs.topk(top_k)
-                print("\nTop predictions for first position:")
-                for prob, idx in zip(values, indices):
-                    if idx == tokenizer.INTERNAL_NODE:
-                        token_name = "INTERNAL_NODE"
-                    elif idx == tokenizer.EOS:
-                        token_name = "EOS"
-                    else:
-                        token_name = str(idx.item())
-                    print(f"{token_name}: {prob:.3f}")
+            if i == 0:  # Only for first example
+                with torch.no_grad():
+                    logits = model(
+                        tree_encodings=tree_encodings[i:i+1],
+                        output_tokens=curr_seq,
+                        attention_mask=None
+                    )
+                    probs = F.softmax(logits[0, 0], dim=-1)
+                    top_k = 5
+                    values, indices = probs.topk(top_k)
+                    print("\nTop predictions for first position:")
+                    for prob, idx in zip(values, indices):
+                        if idx == tokenizer.INTERNAL_NODE:
+                            token_name = "INTERNAL_NODE"
+                        elif idx == tokenizer.EOS:
+                            token_name = "EOS"
+                        else:
+                            token_name = str(idx.item())
+                        print(f"{token_name}: {prob:.3f}")
 
 
 def main():

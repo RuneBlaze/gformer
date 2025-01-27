@@ -8,16 +8,8 @@ import torch.nn.functional as F
 import yaml
 
 from constants import (
-    EMBEDDING_DIM,
-    EOS,
-    INTERNAL_NODE,
     MAX_SEQUENCE_LENGTH,
     MAX_TAXA,
-    MLP_HIDDEN_DIM,
-    NUM_HEADS,
-    NUM_LAYERS,
-    PAD,
-    TREE_EMBEDDING_DIM,
     VOCAB_SIZE,
 )
 
@@ -151,15 +143,6 @@ class TreeTransformer(nn.Module):
         # Output projection
         self.output_projection = nn.Linear(config.embedding_dim, VOCAB_SIZE)
 
-        # Enable support for gradient checkpointing
-        self.gradient_checkpointing = False
-
-    def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory efficiency"""
-        ...
-        # self.gradient_checkpointing = True
-        # self.encoder.enable_gradient_checkpointing()
-        # self.decoder.enable_gradient_checkpointing()
 
     def forward(
         self,
@@ -168,9 +151,6 @@ class TreeTransformer(nn.Module):
         attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
-
-        
-
         # Reshape tree encodings to process each gene tree through MLP
         tree_encodings = einops.rearrange(
             tree_encodings,

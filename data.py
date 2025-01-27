@@ -10,9 +10,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 import treeswift as ts
-from rich import print as rprint
 from rich.console import Console
-from rich.progress import track
 from torch.utils.data import Dataset
 
 from constants import MAX_GTREES, MAX_TAXA, PAD
@@ -135,10 +133,6 @@ class TreeDataset(Dataset):
                 df = df[df.index.isin(val_indices)]
         
         console.print(f"Loading {split} split with {len(df)} examples")
-
-        import treeswift as ts
-
-        
         
         for _, row in df.iterrows():
             stree = ts.read_tree_newick(row['species_tree'])
