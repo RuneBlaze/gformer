@@ -397,7 +397,7 @@ def show_example_completions(
                     curr_seq = torch.cat([curr_seq, next_token], dim=1)
 
                 pred_completion = tokenizer.decode(
-                    [INTERNAL_NODE] + curr_seq[0].cpu().tolist()
+                    curr_seq[0].cpu().tolist()
                 )
 
                 # Print comparison
