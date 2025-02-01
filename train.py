@@ -462,6 +462,11 @@ def main():
         default=4,
         help="Number of processes for parallel preprocessing",
     )
+    train_parser.add_argument(
+        "--resume-from",
+        type=str,
+        help="Path to checkpoint file to resume training from",
+    )
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser("count-params", help="Count model parameters")
@@ -546,14 +551,26 @@ def main():
             warmup_steps=training_config.warmup_steps,
         )
 
+        # Load checkpoint if specified
+        start_epoch = 0
+        best_val_loss = float("inf")
+        if args.resume_from:
+            logger.info(f"Loading checkpoint from {args.resume_from}")
+            checkpoint = torch.load(args.resume_from, map_location='cpu')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            logger.info(f"Resuming from epoch {start_epoch}")
+
         # Prepare everything with accelerator
         model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
             model, optimizer, train_loader, val_loader, scheduler
         )
 
         # Training loop
-        best_val_loss = float("inf")
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             train_loss = train_epoch(
                 model,
                 train_loader,
@@ -585,7 +602,9 @@ def main():
                                 model
                             ).state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
                             "train_loss": train_loss,
+                            "best_val_loss": best_val_loss,
                         },
                         checkpoint_path,
                     )
