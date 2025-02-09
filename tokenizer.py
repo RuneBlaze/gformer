@@ -26,7 +26,7 @@ class NewickTokenizer:
         Returns:
             List of integer tokens
         """
-        # Remove leading/trailing whitespace and trailing semicolon if present
+
         import treeswift as ts
         parsed = ts.read_tree_newick(newick_str)
         parsed.suppress_unifurcations()
@@ -34,45 +34,24 @@ class NewickTokenizer:
         if '[&R]' in newick_str:
             newick_str = newick_str.replace('[&R]', '')
         newick_str = newick_str.strip()
-        if newick_str.endswith(";"):
-            newick_str = newick_str[:-1]
 
         def parse_subtree(index: int) -> (List[int], int):
-            # Skip whitespace (if any)
-            while index < len(newick_str) and newick_str[index].isspace():
-                index += 1
             tokens = []
             if newick_str[index] == "(":
                 tokens.append(self.INTERNAL_NODE)
-                index += 1  # Skip the opening parenthesis
-                # Parse left subtree
+                index += 1
                 left_tokens, index = parse_subtree(index)
                 tokens.extend(left_tokens)
-                # Skip whitespace
-                while index < len(newick_str) and newick_str[index].isspace():
-                    index += 1
-                # Expect a comma delimiter
-                if index >= len(newick_str) or newick_str[index] != ",":
-                    raise ValueError(f"Expected ',' at position {index} in {newick_str}")
                 index += 1  # Skip the comma
-                # Parse right subtree
                 right_tokens, index = parse_subtree(index)
                 tokens.extend(right_tokens)
-                # Skip whitespace
-                while index < len(newick_str) and newick_str[index].isspace():
-                    index += 1
-                # Expect the closing parenthesis
-                if index >= len(newick_str) or newick_str[index] != ")":
-                    raise ValueError(f"Expected ')' at position {index} in {newick_str}")
                 index += 1  # Skip the closing parenthesis
             else:
-                # Parse a leaf label (a number)
+                # Parse a leaf label
                 number = ""
                 while index < len(newick_str) and newick_str[index].isdigit():
                     number += newick_str[index]
                     index += 1
-                if number == "":
-                    raise ValueError(f"Expected a digit at position {index} in {newick_str}")
                 tokens.append(int(number))
             return tokens, index
 
