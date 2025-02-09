@@ -457,12 +457,6 @@ def main():
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
     train_parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of processes for parallel preprocessing",
-    )
-    train_parser.add_argument(
         "--resume-from",
         type=str,
         help="Path to checkpoint file to resume training from",
@@ -512,24 +506,18 @@ def main():
         # Create datasets and dataloaders
         train_dataset = TreeDataset(
             args.data,
-            split="train",
-            val_ratio=args.val_ratio,
             seed=args.seed,
-            num_workers=args.num_workers,
         )
 
         val_dataset = TreeDataset(
             args.data,
-            split="val",
-            val_ratio=args.val_ratio,
-            seed=args.seed,
-            num_workers=args.num_workers,
+            seed=args.seed ^ 0xdeadbeef,
         )
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=training_config.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=1,
         )
 
@@ -539,7 +527,6 @@ def main():
             shuffle=False,
             num_workers=1,
         )
-
         # Initialize optimizer and scheduler
         optimizer = get_optimizer(model, training_config)
         total_steps = (

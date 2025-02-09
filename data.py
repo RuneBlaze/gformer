@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 import json
 import random
@@ -16,7 +17,98 @@ from torch.utils.data import Dataset
 from constants import MAX_GTREES, MAX_TAXA, PAD
 from tokenizer import NewickTokenizer
 
+import pickle as pkl
+from itertools import islice
+import treeswift as ts
+from smallperm import PseudoRandomPermutation as PRP
+import logging
+from typing import Any
+from itertools import combinations
+from pathlib import Path
+from dataclasses import dataclass
+from teedeelee import DistanceMatrix, SortBy
+import numpy as np
+from random import Random
+
 console = Console()
+
+@dataclass
+class MSCDataPoint:
+    distance_matrices: list[DistanceMatrix]
+    species_tree: str
+
+    def distance_matrices_numpy(self) -> np.ndarray:
+        return np.array([self.to_numpy(mat) for mat in self.distance_matrices])
+    
+    @staticmethod
+    def to_numpy(mat: DistanceMatrix) -> np.ndarray:
+        ts_names = set(mat.taxon_set.names())
+        for t in range(mat.ntaxa):
+            if mat.get_taxon_name(t) not in ts_names:
+                raise ValueError(f"Taxon {t} not in taxon set")
+        # Get upper triangular entries (excluding diagonal) in row-major order
+        triu_entries = []
+        for i in range(mat.ntaxa):
+            for j in range(i + 1, mat.ntaxa):
+                distance = int(mat[str(i), str(j)])
+                # Convert to 8-bit binary representation
+                binary = [(distance >> bit) & 1 for bit in range(8)]
+                triu_entries.append(binary)
+        return np.array(triu_entries, dtype=np.bool_)
+
+class MSCDataset:
+    def __init__(
+        self,
+        pkl_path: str,
+        k_min_max: tuple[int, int],
+        m: int,
+        seed: int,
+    ) -> None:
+        with open(pkl_path, 'rb') as f:
+            self.family = pkl.load(f)
+        self.nfamily = len(self.family)
+        self.k_min, self.k_max = k_min_max
+        self.m = m
+        self.seed = seed
+    
+    def __len__(self) -> int:
+        return 2 ** 32
+    
+    def __getitem__(self, idx: int) -> MSCDataPoint:
+        # Initialize random state
+        rng = Random((idx ^ self.seed) % 2**32)
+        
+        # Select which family and get trees
+        which_family = idx % self.nfamily
+        trees = self.family[which_family]
+        
+        # Get sorted taxon names and select subset
+        sorted_names = sorted(trees.taxon_set.names())
+        prp_names = PRP(len(sorted_names), rng.randint(0, 2**32))
+        subset_names = [sorted_names[i] for i in islice(prp_names, self.m)]
+        
+        # Create name mapping
+        mapper = {name: str(i) for i, name in enumerate(subset_names)}
+        
+        # Select random subset of trees
+        k = rng.randint(self.k_min, self.k_max)
+        prp = PRP(len(trees), rng.randint(0, 2**32))
+        subindices = list(islice(prp, k))
+        subset_trees = [trees[i] for i in subindices]
+        
+        # Restrict trees to subset of taxa and remap names
+        subset_trees_restricted = [tree.restriction(subset_names).remap(mapper) for tree in subset_trees]
+        
+        # Process species tree
+        species_tree = trees.get_species_tree()
+        species_tree_restricted = species_tree.restriction(subset_names).remap(mapper).sort_by_multiple(
+            [(SortBy.DescendantCount, True), (SortBy.LexicographicalOrder, True)]
+        )
+        
+        # Generate distance matrices and return
+        distance_matrices = [tree.get_distance_matrix() for tree in subset_trees_restricted]
+        return MSCDataPoint(distance_matrices, species_tree_restricted.newick())
+
 
 
 @dataclass
@@ -77,11 +169,7 @@ class TreeDataset(Dataset):
     def __init__(
         self,
         data_source: str,
-        max_sequence_length: int = 1024,
-        split: str = "train",
-        val_ratio: float = 0.2,
         seed: int = 42,
-        num_workers: int = 4,
     ):
         """
         Initialize the dataset.
@@ -94,124 +182,45 @@ class TreeDataset(Dataset):
             seed: Random seed for reproducibility
             num_workers: Number of processes for parallel preprocessing
         """
-        self.max_sequence_length = max_sequence_length
-        self.data: List[InputPair] = []
+        self._data = None
         self.tokenizer = NewickTokenizer()
-        self.cached_encodings = []
-        self.num_workers = min(num_workers, cpu_count())
-
-        random.seed(seed)
-
-        if data_source.endswith(".parquet"):
-            self._load_from_parquet(data_source, split, val_ratio)
-        else:
-            self._load_from_jsonl(data_source)
-
-        console.print(
-            f"Pre-encoding trees for {split} split using {self.num_workers} processes..."
-        )
-        self._parallel_encode_trees()
-
-    def _load_from_parquet(self, parquet_path: str, split: str, val_ratio: float):
-        """Load data from parquet file with train/val split based on directories"""
-        table = pq.read_table(parquet_path)
-        df = table.to_pandas()
-
-        # Get unique directories and check if we have enough for directory-based split
-        all_dirs = sorted(df["directory"].unique())
-        n_val = int(len(all_dirs) * val_ratio)
-
-        if n_val >= 1:
-            # Directory-based split if we have enough directories
-            val_dirs = set(random.sample(all_dirs, n_val))
-
-            # Filter based on split
-            if split == "train":
-                df = df[~df["directory"].isin(val_dirs)]
-            else:  # val
-                df = df[df["directory"].isin(val_dirs)]
-        else:
-            # Fallback to random row-based split if too few directories
-            all_indices = list(range(len(df)))
-            n_val_samples = int(len(df) * val_ratio)
-            val_indices = set(random.sample(all_indices, n_val_samples))
-
-            if split == "train":
-                df = df[~df.index.isin(val_indices)]
-            else:  # val
-                df = df[df.index.isin(val_indices)]
-
-        console.print(f"Loading {split} split with {len(df)} examples")
-
-        for _, row in df.iterrows():
-            stree = ts.read_tree_newick(row["species_tree"])
-            stree.order("num_descendants_then_label")
-            self.data.append(
-                InputPair(gtrees=row["gtrees"], stree=stree.newick().lstrip("[&R] "))
-            )
-
-    def _load_from_jsonl(self, jsonl_path: str):
-        """Load data from jsonl file (legacy support)"""
-        with open(jsonl_path, "r") as f:
-            for line in f:
-                item = json.loads(line)
-                self.data.append(
-                    InputPair(gtrees=item["gtrees"], stree=item["species_tree"])
-                )
-
+        self.data_source = data_source
+        self.seed = seed
     def __len__(self) -> int:
-        return len(self.data)
+        return 2 ** 32
 
-    def encode_trees(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
-        encoded_trees = []
-        for tree in pair.gtrees:
-            distance_matrix = InputPair.newick_to_distance_matrix(tree)
-            encoded = encode_distance_matrix(distance_matrix)
-            encoded_trees.append(encoded)
+    # def encode_trees(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     encoded_trees = []
+    #     for tree in pair.gtrees:
+    #         distance_matrix = InputPair.newick_to_distance_matrix(tree)
+    #         encoded = encode_distance_matrix(distance_matrix)
+    #         encoded_trees.append(encoded)
 
-        tree_tensor = torch.stack(encoded_trees, dim=0)
-        species_tokens = torch.tensor(self.tokenizer.encode(pair.stree))
+    #     tree_tensor = torch.stack(encoded_trees, dim=0)
+    #     species_tokens = torch.tensor(self.tokenizer.encode(pair.stree))
+    #     species_tokens = torch.cat(
+    #         [
+    #             species_tokens,
+    #             torch.tensor([self.tokenizer.EOS]),
+    #         ]
+    #     )
+
+    def _load_data(self) -> MSCDataset:
+        return MSCDataset(self.data_source, k_min_max=(200, 299), m=16, seed=self.seed)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._data is None:
+            self._data = self._load_data()
+        unpacked = self._data[idx]
+
+        tree_tensor = torch.from_numpy(unpacked.distance_matrices_numpy()).to(torch.float32)
+        species_tokens = torch.tensor(self.tokenizer.encode(unpacked.species_tree))
         species_tokens = torch.cat(
             [
                 species_tokens,
                 torch.tensor([self.tokenizer.EOS]),
             ]
         )
-
-        return tree_tensor, species_tokens
-
-    def _encode_single_item(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode a single item for parallel processing"""
-        return self.encode_trees(pair)
-
-    def _parallel_encode_trees(self):
-        """Parallel processing of tree encoding using chunks"""
-        CHUNK_SIZE = 100
-        with Pool(processes=self.num_workers) as pool:
-            total = len(self.data)
-            chunks = [
-                self.data[i : i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)
-            ]
-
-            with console.status(f"[bold green]Processing trees...") as status:
-                processed = 0
-                for chunk_results in pool.imap(
-                    self._encode_chunk,
-                    chunks,
-                    chunksize=1,  # Each "chunk" here is already a batch of items
-                ):
-                    self.cached_encodings.extend(chunk_results)
-                    processed += len(chunk_results)
-                    console.print(f"Processed {processed}/{total} trees")
-
-    def _encode_chunk(
-        self, pairs: List[InputPair]
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """Encode a chunk of items"""
-        return [self.encode_trees(pair) for pair in pairs]
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        tree_tensor, species_tokens = self.cached_encodings[idx]
 
         # Get actual number of trees
         num_gene_trees = min(tree_tensor.size(0), MAX_GTREES)
@@ -257,51 +266,17 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    # Create datasets
-    if args.data_path.endswith(".parquet"):
-        train_dataset = TreeDataset(
-            args.data_path,
-            max_sequence_length=args.max_seq_length,
-            split="train",
-            val_ratio=args.val_ratio,
-            seed=args.seed,
-            num_workers=args.num_workers,
-        )
-        val_dataset = TreeDataset(
-            args.data_path,
-            max_sequence_length=args.max_seq_length,
-            split="val",
-            val_ratio=args.val_ratio,
-            seed=args.seed,
-            num_workers=args.num_workers,
-        )
-
-        console.print(f"[green]Dataset loaded successfully!")
-        console.print(f"Train size: {len(train_dataset)}")
-        console.print(f"Val size: {len(val_dataset)}")
-    else:
-        # Legacy jsonl support
-        dataset = TreeDataset(
-            args.data_path, args.max_seq_length, num_workers=args.num_workers
-        )
-        console.print(f"[green]Dataset loaded successfully!")
-        console.print(f"Dataset size: {len(dataset)}")
-
-    # Look at first few items
-    console.print("\n[yellow]Sample items:[/yellow]")
-    dataset_to_inspect = (
-        train_dataset if args.data_path.endswith(".parquet") else dataset
+    dataset = TreeDataset(
+        "/Users/lbq/goof/teedeelee/assets/processed_family.pkl"
     )
 
-    for i in range(min(3, len(dataset_to_inspect))):
-        tree_tensor, species_tokens = dataset_to_inspect[i]
+    for i in range(min(3, len(dataset))):
+        tree_tensor, species_tokens = dataset[i]
         console.print(f"\n[cyan]Item {i}:[/cyan]")
         console.print(f"Tree tensor shape: {tree_tensor.shape}")
         console.print(f"Species tokens shape: {species_tokens.shape}")
         console.print(f"First few species tokens: {species_tokens[:10]}")
         console.print(f"Tree tensor: {tree_tensor[:, :10]}")
         # Add decoded species tree output
-        decoded_stree = dataset_to_inspect.tokenizer.decode(species_tokens.tolist())
+        decoded_stree = dataset.tokenizer.decode(species_tokens.tolist())
         console.print(f"Decoded species tree: {decoded_stree}")

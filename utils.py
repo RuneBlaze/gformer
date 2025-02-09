@@ -96,6 +96,8 @@ def only_topology(
 ) -> ts.Tree:
     for node in tree.traverse_postorder():
         node.edge_length = None
+        if node.num_children() > 0:
+            node.label = None
     return tree
 
 
