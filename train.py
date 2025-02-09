@@ -2,6 +2,7 @@ import argparse
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -147,10 +148,15 @@ def train_epoch(
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     accelerator: Accelerator,
     epoch: int,
-) -> float:
+    last_save_time: float,
+    save_interval_seconds: float,
+    args,
+    best_val_loss: float,
+) -> tuple[float, float]:
     """Modified training loop to use Accelerate's built-in gradient accumulation"""
     model.train()
     total_loss = 0
+    current_time = time.time()
 
     progress_bar = tqdm(
         dataloader, desc=f"Epoch {epoch}", disable=not accelerator.is_local_main_process
@@ -185,7 +191,31 @@ def train_epoch(
         total_loss += loss.item()
         progress_bar.set_postfix({"loss": loss.item()})
 
-    return total_loss / len(dataloader)
+        # Check if it's time to save a checkpoint
+        if (accelerator.is_local_main_process and 
+            current_time - last_save_time >= save_interval_seconds):
+            
+            checkpoint_path = os.path.join(
+                args.save_dir, f"model_epoch_{epoch}_step_{batch_idx}.pt"
+            )
+            accelerator.save(
+                {
+                    "epoch": epoch,
+                    "step": batch_idx,
+                    "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "train_loss": total_loss / (batch_idx + 1),
+                    "best_val_loss": best_val_loss,
+                },
+                checkpoint_path,
+            )
+            logging.info(f"Saved checkpoint to {checkpoint_path}")
+            last_save_time = current_time
+
+        current_time = time.time()
+
+    return total_loss / len(dataloader), last_save_time
 
 
 def compute_tree_accuracy(
@@ -556,15 +586,23 @@ def main():
             model, optimizer, train_loader, val_loader, scheduler
         )
 
+        # Initialize time tracking for checkpoints
+        last_save_time = time.time()
+        save_interval_seconds = 1 * 60 * 60  # 3 hours in seconds
+
         # Training loop
         for epoch in range(start_epoch, args.epochs):
-            train_loss = train_epoch(
+            train_loss, last_save_time = train_epoch(
                 model,
                 train_loader,
                 optimizer,
                 scheduler,
                 accelerator,
                 epoch,
+                last_save_time,
+                save_interval_seconds,
+                args,
+                best_val_loss,
             )
 
             # Only log on main process
@@ -573,7 +611,7 @@ def main():
                 logger.info("Example completions:")
                 show_example_completions(model, val_loader, device, tokenizer)
 
-                # Save checkpoint if we've hit the save interval
+                # Keep the epoch-based checkpoint saving as well
                 if (
                     training_config.save_interval > 0
                     and (epoch + 1) % training_config.save_interval == 0
