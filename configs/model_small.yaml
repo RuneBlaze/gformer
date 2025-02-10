@@ -8,11 +8,16 @@ model:
 
 training:
   batch_size: 2
-  learning_rate: 1e-4
-  warmup_steps: 100
+  learning_rate: 1e-3
+  # warmup_steps: 100
   grad_clip: 1.0
   optimizer:
-    name: "adamw"  # Options: adamw, adam, sgd, adafactor
-    memory_efficient: true
-  mixed_precision: true  # Enable automatic mixed precision
-  gradient_checkpointing: true  # Enable gradient checkpointing 
+    name: "adam"  # Can be "adam", "adamw", "sgd", or "adafactor"
+    memory_efficient: true  # Use fused implementation when available
+  # scheduler:
+  #   name: "cosine_warmup"  # Can be "cosine_warmup", "linear_warmup", "constant", or "none"
+  #   warmup_steps: 1000  # Moving warmup_steps here for better organization
+  mixed_precision: false
+  gradient_checkpointing: false
+  gradient_accumulation_steps: 32
+  save_interval: 1
