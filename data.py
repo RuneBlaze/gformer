@@ -206,7 +206,7 @@ class TreeDataset(Dataset):
     #     )
 
     def _load_data(self) -> MSCDataset:
-        return MSCDataset(self.data_source, k_min_max=(200, 299), m=16, seed=self.seed)
+        return MSCDataset(self.data_source, k_min_max=(230, 299), m=16, seed=self.seed)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._data is None:
@@ -218,7 +218,6 @@ class TreeDataset(Dataset):
         species_tokens = torch.cat(
             [
                 species_tokens,
-                torch.tensor([self.tokenizer.EOS]),
             ]
         )
 
@@ -270,13 +269,17 @@ if __name__ == "__main__":
         "/Users/lbq/goof/teedeelee/assets/processed_family.pkl"
     )
 
-    for i in range(min(3, len(dataset))):
-        tree_tensor, species_tokens = dataset[i]
+    for i in range(1694, 10000):
+        try:
+            tree_tensor, species_tokens = dataset[i]
+        except Exception as e:
+            print(f"Error at item {i}: {e}")
+            raise e
         console.print(f"\n[cyan]Item {i}:[/cyan]")
         console.print(f"Tree tensor shape: {tree_tensor.shape}")
         console.print(f"Species tokens shape: {species_tokens.shape}")
-        console.print(f"First few species tokens: {species_tokens[:10]}")
-        console.print(f"Tree tensor: {tree_tensor[:, :10]}")
-        # Add decoded species tree output
+        # console.print(f"First few species tokens: {species_tokens[:10]}")
+        # console.print(f"Tree tensor: {tree_tensor[:, :10]}")
+        # # Add decoded species tree output
         decoded_stree = dataset.tokenizer.decode(species_tokens.tolist())
         console.print(f"Decoded species tree: {decoded_stree}")

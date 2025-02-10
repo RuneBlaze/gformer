@@ -157,7 +157,11 @@ def train_epoch(
     model.train()
     total_loss = 0
     current_time = time.time()
-
+    
+    # Add tracking for hourly loss logging
+    hourly_losses = []
+    last_hourly_log_time = current_time
+    
     progress_bar = tqdm(
         dataloader, desc=f"Epoch {epoch}", disable=not accelerator.is_local_main_process
     )
@@ -188,8 +192,21 @@ def train_epoch(
             scheduler.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item()
-        progress_bar.set_postfix({"loss": loss.item()})
+        loss_value = loss.item()
+        total_loss += loss_value
+        hourly_losses.append(loss_value)
+        progress_bar.set_postfix({"loss": loss_value})
+
+        current_time = time.time()
+
+        # Log hourly average loss
+        if current_time - last_hourly_log_time >= 3600:  # 1 hour in seconds
+            if accelerator.is_local_main_process and hourly_losses:
+                avg_hourly_loss = sum(hourly_losses) / len(hourly_losses)
+                logging.info(f"Epoch {epoch} - Hour {int((current_time - last_hourly_log_time) / 3600)} "
+                           f"- Average loss: {avg_hourly_loss:.4f}")
+            hourly_losses = []  # Reset hourly losses
+            last_hourly_log_time = current_time
 
         # Check if it's time to save a checkpoint
         if (accelerator.is_local_main_process and 
@@ -212,8 +229,6 @@ def train_epoch(
             )
             logging.info(f"Saved checkpoint to {checkpoint_path}")
             last_save_time = current_time
-
-        current_time = time.time()
 
     return total_loss / len(dataloader), last_save_time
 
@@ -491,6 +506,11 @@ def main():
         type=str,
         help="Path to checkpoint file to resume training from",
     )
+    train_parser.add_argument(
+        "--resume-weights-only",
+        action="store_true",
+        help="When resuming, only load model weights and ignore optimizer/scheduler state",
+    )
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser("count-params", help="Count model parameters")
@@ -574,12 +594,19 @@ def main():
         if args.resume_from:
             logger.info(f"Loading checkpoint from {args.resume_from}")
             checkpoint = torch.load(args.resume_from, map_location='cpu')
+            
+            # Always load model weights
             model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            logger.info(f"Resuming from epoch {start_epoch}")
+            
+            if not args.resume_weights_only:
+                # Load optimizer and scheduler state only if not weights-only mode
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                logger.info(f"Resuming from epoch {start_epoch}")
+            else:
+                logger.info("Loaded model weights only, starting from epoch 0")
 
         # Prepare everything with accelerator
         model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
