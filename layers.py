@@ -103,9 +103,9 @@ class ModelConfig:
 class TrainingConfig:
     batch_size: int
     learning_rate: float
-    warmup_steps: int
     grad_clip: float
     optimizer: dict
+    scheduler: dict
     mixed_precision: bool
     gradient_checkpointing: bool
     gradient_accumulation_steps: int = 1
@@ -121,7 +121,20 @@ class TrainingConfig:
         training_config["learning_rate"] = float(training_config["learning_rate"])
         training_config["grad_clip"] = float(training_config["grad_clip"])
         training_config["batch_size"] = int(training_config["batch_size"])
-        training_config["warmup_steps"] = int(training_config["warmup_steps"])
+
+        # Ensure optimizer config exists with defaults
+        if "optimizer" not in training_config:
+            training_config["optimizer"] = {
+                "name": "adamw",
+                "memory_efficient": False
+            }
+
+        # Ensure scheduler config exists with defaults
+        if "scheduler" not in training_config:
+            training_config["scheduler"] = {
+                "name": "cosine_warmup",
+                "warmup_steps": 1000
+            }
 
         return cls(**training_config)
 

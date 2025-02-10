@@ -94,18 +94,33 @@ def create_causal_mask(
     return mask
 
 
-def get_scheduler(optimizer, total_steps: int, warmup_steps: int):
+def get_scheduler(optimizer, total_steps: int, config: TrainingConfig):
     """
-    Creates a learning rate scheduler with linear warmup and cosine decay
+    Creates a learning rate scheduler based on config
     """
+    scheduler_name = config.scheduler["name"].lower()
+    warmup_steps = config.scheduler.get("warmup_steps", 0)
 
-    def lr_lambda(current_step: int):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(
-            max(1, total_steps - warmup_steps)
-        )
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if scheduler_name == "none" or scheduler_name == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    elif scheduler_name == "cosine_warmup":
+        def lr_lambda(current_step: int):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(
+                max(1, total_steps - warmup_steps)
+            )
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    elif scheduler_name == "linear_warmup":
+        def lr_lambda(current_step: int):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            return 1.0
+
+    else:
+        raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -585,7 +600,7 @@ def main():
         scheduler = get_scheduler(
             optimizer,
             total_steps=total_steps,
-            warmup_steps=training_config.warmup_steps,
+            config=training_config,
         )
 
         # Load checkpoint if specified
