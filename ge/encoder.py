@@ -85,7 +85,7 @@ class QuartetClassifier(nn.Module):
         # MLP that takes the concatenated representation and outputs logits.
         self.mlp = nn.Sequential(
             nn.Linear(gene_embed_dim + 4 * species_embed_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, num_quartet_classes)
         )
     
