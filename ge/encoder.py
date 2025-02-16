@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 
@@ -8,65 +9,59 @@ import torch.nn.functional as F
 NUM_SPECIES = 16
 NUM_PAIRS = (NUM_SPECIES * (NUM_SPECIES - 1)) // 2  # = 120
 
+def generate_pair_indices(n):
+    pair_indices = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_indices.append((i, j))
+    return pair_indices
 
 class GeneTreeEncoder(nn.Module):
     """
     Encoder-only architecture for a gene tree.
-    Input: binary-encoded distance matrix patches of shape [batch, NUM_PAIRS, bits] (bits=8)
-    We prepend a <CLS> token, add learned positional embeddings,
-    and process with a Transformer encoder.
-    The output at the <CLS> token becomes the gene tree representation.
+    For ablation purposes, this encoder simply flattens the input and applies an MLP
+    projection to produce a gene tree representation.
+    
+    Input: distance matrix patches of shape [batch, NUM_PAIRS, bits]
+    Output: gene tree representation of shape [batch, embed_dim]
     """
-    def __init__(self, bits=8, num_pairs=NUM_PAIRS, embed_dim=256,
-                 num_layers=4, num_heads=8, dropout=0.1):
+    def __init__(self, bits=8, num_pairs=NUM_PAIRS, embed_dim=256):
         super().__init__()
         self.bits = bits
         self.embed_dim = embed_dim
-
-        # Embed each binary vector (length bits) into an embedding vector.
-        self.token_embedding = nn.Linear(bits, embed_dim)
-
-        # Learnable <CLS> token.
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-
-        # Learned positional embedding for the sequence tokens (including CLS).
-        self.pos_embedding = nn.Parameter(torch.zeros(1, num_pairs + 1, embed_dim))
-
-        # Transformer encoder. (Using PyTorch's transformer encoder layer with batch_first=True)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dropout=dropout, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.num_pairs = num_pairs
+        self.flattened_dim = num_pairs * bits
         
-        # Initialize parameters
+        # Updated MLP: now a two-layer MLP with a SiLU activation
+        self.mlp = nn.Sequential(
+            nn.Linear(self.flattened_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.pos_embedding, std=0.02)
-        nn.init.xavier_uniform_(self.token_embedding.weight)
-        if self.token_embedding.bias is not None:
-            nn.init.zeros_(self.token_embedding.bias)
+        # Update the initialization for all Linear layers in the MLP.
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         
     def forward(self, x):
         """
         x: Tensor of shape [batch, NUM_PAIRS, bits]
+        Returns: Tensor of shape [batch, embed_dim]
+        
+        For ablation, the forward method simply flattens the binary-encoded distance matrix
+        and projects it through an MLP.
         """
         batch_size = x.size(0)
-        # Map each binary patch (vector of length bits) to embedding.
-        token_embeds = self.token_embedding(x)  # [batch, NUM_PAIRS, embed_dim]
-        # Expand and prepend the CLS token.
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [batch, 1, embed_dim]
-        tokens = torch.cat([cls_tokens, token_embeds], dim=1)  # [batch, NUM_PAIRS+1, embed_dim]
-        # Add positional embedding.
-        tokens = tokens + self.pos_embedding  # broadcasting over batch
-        
-        # Transformer encoder.
-        encoded = self.transformer(tokens)  # [batch, NUM_PAIRS+1, embed_dim]
-        encoded = self.norm(encoded)
-        # Return the representation at the CLS token.
-        return encoded[:, 0, :]  # shape: [batch, embed_dim]
+        # Flatten the input: [batch, NUM_PAIRS, bits] -> [batch, NUM_PAIRS * bits]
+        x_flat = x.view(batch_size, -1)  # shape: [batch, num_pairs * bits]
+        output = self.mlp(x_flat)        # shape: [batch, embed_dim]
+        return output
 
 
 class QuartetClassifier(nn.Module):
@@ -82,12 +77,8 @@ class QuartetClassifier(nn.Module):
         super().__init__()
         # Learn an embedding for each species.
         self.species_embedding = nn.Embedding(num_species, species_embed_dim)
-        # MLP that takes the concatenated representation and outputs logits.
-        self.mlp = nn.Sequential(
-            nn.Linear(gene_embed_dim + 4 * species_embed_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, num_quartet_classes)
-        )
+        # Updated MLP in the classifier: simplified to a single linear layer.
+        self.mlp = nn.Linear(gene_embed_dim + 4 * species_embed_dim, num_quartet_classes)
     
     def forward(self, gene_repr, quartet_indices):
         """

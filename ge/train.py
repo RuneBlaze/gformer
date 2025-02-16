@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from accelerate import Accelerator
 from ge.encoder import GeneTreeEncoder, QuartetClassifier
 from ge.data import GeneTreeDataset
+import time
+import os
+from pathlib import Path
 
 def train(
     pkl_path: str,
@@ -12,12 +15,24 @@ def train(
     batch_size: int = 32,
     num_epochs: int = 10,
     learning_rate: float = 1e-4,
+    debug_overfit: bool = False,
+    checkpoint_dir: str = "checkpoints",
 ):
+    # Create checkpoint directory if it doesn't exist
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(exist_ok=True)
+    
     # Initialize accelerator
     accelerator = Accelerator()
 
     # Initialize dataset and dataloader
     dataset = GeneTreeDataset(pkl_path, m=num_species, seed=42)
+    
+    # If in debug mode, create a subset with just one sample
+    if debug_overfit:
+        dataset = torch.utils.data.Subset(dataset, indices=[0])
+        accelerator.print("DEBUG MODE: Training on single sample for overfitting test")
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -26,11 +41,18 @@ def train(
     )
 
     # Initialize models
-    encoder = GeneTreeEncoder()
+    # Note: disable dropout for the encoder when debugging overfit.
+    if debug_overfit:
+        encoder = GeneTreeEncoder(dropout=0.0)
+        accelerator.print("DEBUG MODE: Using dropout=0.0 and a higher learning rate")
+        # Optionally bump up the learning rate when debugging overfit.
+        learning_rate = 1e-3
+    else:
+        encoder = GeneTreeEncoder()
     classifier = QuartetClassifier()
 
     # Initialize optimizer
-    optimizer = Adam(
+    optimizer = AdamW(
         list(encoder.parameters()) + list(classifier.parameters()),
         lr=learning_rate
     )
@@ -44,6 +66,9 @@ def train(
     criterion = nn.CrossEntropyLoss()
 
     # Training loop
+    start_time = time.time()
+    last_checkpoint_time = start_time
+    
     for epoch in range(num_epochs):
         total_loss = 0
         correct = 0
@@ -91,6 +116,25 @@ def train(
                     f"Accuracy: {100 * correct/total:.2f}%"
                 )
 
+            # Check if 2 hours have passed since last checkpoint
+            current_time = time.time()
+            if current_time - last_checkpoint_time >= 7200:  # 7200 seconds = 2 hours
+                # Save checkpoint
+                checkpoint_path = checkpoint_dir / f"checkpoint_epoch{epoch}_batch{batch_idx}"
+                unwrapped_encoder = accelerator.unwrap_model(encoder)
+                unwrapped_classifier = accelerator.unwrap_model(classifier)
+                
+                torch.save(
+                    unwrapped_encoder.state_dict(), 
+                    str(checkpoint_path) + "_encoder.pt"
+                )
+                torch.save(
+                    unwrapped_classifier.state_dict(), 
+                    str(checkpoint_path) + "_classifier.pt"
+                )
+                accelerator.print(f"Saved checkpoint at {checkpoint_path}")
+                last_checkpoint_time = current_time
+
         # Print epoch statistics
         avg_loss = total_loss / len(dataloader)
         accuracy = 100 * correct / total
@@ -113,7 +157,9 @@ if __name__ == "__main__":
         pkl_path=PKL_PATH,
         num_species=16,
         batch_size=32,
-        num_epochs=10,
+        num_epochs=100,
+        debug_overfit=False,
+        checkpoint_dir="checkpoints"
     )
 
     # Optionally save the trained models
