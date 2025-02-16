@@ -85,26 +85,19 @@ class PositionalEncoding(nn.Module):
 
 @dataclass
 class ModelConfig:
-    # Model architecture parameters
+    # Model architecture parameters only
     embedding_dim: int
     num_heads: int
     num_layers: int
     mlp_hidden_dim: int
     tree_embedding_dim: int
     max_sequence_length: int
-    
-    # Training parameters
-    batch_size: int
-    learning_rate: float
-    warmup_steps: int
-    grad_clip: float
-    gradient_accumulation_steps: int = 1  # Default to 1 if not specified
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ModelConfig":
         with open(yaml_path) as f:
             config = yaml.safe_load(f)
-        # Merge model and training sections
+        # Only use model section
         model_config = config["model"]
         return cls(**model_config)
 

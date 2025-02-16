@@ -195,6 +195,7 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
 
 @dataclass
 class TrainingConfig:
+    # Training parameters
     batch_size: int
     learning_rate: float
     warmup_steps: int
@@ -209,7 +210,6 @@ class TrainingConfig:
     def from_yaml(cls, yaml_path: str) -> "TrainingConfig":
         with open(yaml_path) as f:
             config = yaml.safe_load(f)
-
         training_config = config["training"]
         return cls(
             batch_size=int(training_config["batch_size"]),
@@ -436,16 +436,17 @@ def main():
         return
 
     elif args.command == "train":
-        # Initialize accelerator with gradient accumulation from config
-        config = ModelConfig.from_yaml(args.config)
-        gradient_accumulation_steps = (
-            args.gradient_accumulation_steps  # CLI arg takes precedence
-            if args.gradient_accumulation_steps is not None
-            else config.gradient_accumulation_steps
-        )
+        # Load both configs
+        model_config = ModelConfig.from_yaml(args.config)
+        training_config = TrainingConfig.from_yaml(args.config)
         
+        # Use training_config for gradient accumulation
         accelerator = Accelerator(
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=(
+                args.gradient_accumulation_steps  # CLI arg takes precedence
+                if args.gradient_accumulation_steps is not None
+                else training_config.gradient_accumulation_steps
+            ),
             mixed_precision="no",
         )
 
@@ -463,9 +464,9 @@ def main():
         if accelerator.is_local_main_process:
             os.makedirs(args.save_dir, exist_ok=True)
 
-        # Initialize model
+        # Initialize model with model_config
         device = accelerator.device
-        model = TreeTransformer(config)
+        model = TreeTransformer(model_config)
 
         # Load initial weights if specified
         if args.init_from:
@@ -493,27 +494,27 @@ def main():
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=args.batch_size or training_config.batch_size,
             shuffle=True,
             num_workers=1,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size or config.batch_size,
+            batch_size=args.batch_size or training_config.batch_size,
             shuffle=False,
             num_workers=1,
         )
 
-        # Initialize optimizer and scheduler
-        optimizer = get_optimizer(model, config)
+        # Use training_config for optimizer and training parameters
+        optimizer = get_optimizer(model, training_config)
         total_steps = (
-            len(train_loader) // args.gradient_accumulation_steps
+            len(train_loader) // training_config.gradient_accumulation_steps
         ) * args.epochs
         scheduler = get_scheduler(
             optimizer,
             total_steps=total_steps,
-            warmup_steps=args.warmup_steps or config.warmup_steps,
+            warmup_steps=args.warmup_steps or training_config.warmup_steps,
         )
 
         # Prepare everything with accelerator
