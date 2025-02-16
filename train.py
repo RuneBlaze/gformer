@@ -435,9 +435,16 @@ def main():
         return
 
     elif args.command == "train":
-        # Initialize accelerator with gradient accumulation
+        # Initialize accelerator with gradient accumulation from config
+        config = ModelConfig.from_yaml(args.config)
+        gradient_accumulation_steps = (
+            args.gradient_accumulation_steps  # CLI arg takes precedence
+            if args.gradient_accumulation_steps is not None
+            else config.gradient_accumulation_steps
+        )
+        
         accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             mixed_precision="no",
         )
 
@@ -457,7 +464,6 @@ def main():
 
         # Initialize model
         device = accelerator.device
-        config = ModelConfig.from_yaml(args.config)
         model = TreeTransformer(config)
 
         # Load initial weights if specified
