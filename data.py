@@ -8,12 +8,11 @@ from typing import List, Tuple
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 import treeswift as ts
 from rich.console import Console
 from torch.utils.data import Dataset
 
-from constants import MAX_GTREES, MAX_TAXA, PAD
+from constants import MAX_GTREES, MAX_TAXA
 from tokenizer import NewickTokenizer
 
 console = Console()
