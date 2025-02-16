@@ -438,7 +438,7 @@ def main():
         # Initialize accelerator with gradient accumulation
         accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            mixed_precision="fp16" if args.mixed_precision else "no",
+            mixed_precision="no",
         )
 
         # Set seed for reproducibility
