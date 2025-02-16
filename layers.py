@@ -192,13 +192,7 @@ class TreeTransformer(nn.Module):
                 ).bool()
                 attention_mask = attention_mask.to(output_tokens.device)
 
-            # Use gradient checkpointing if enabled
-            if self.gradient_checkpointing and self.training:
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    self.decoder, decoder_input, memory, attention_mask
-                )
-            else:
-                hidden_states = self.decoder(decoder_input, memory, attention_mask)
+            hidden_states = self.decoder(decoder_input, memory, attention_mask)
         else:
             # Inference mode - start with memory
             hidden_states = memory
