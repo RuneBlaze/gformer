@@ -13,6 +13,7 @@ dependencies = [
     "pyarrow>=19.0.0",
     "pyyaml>=6.0.2",
     "smallperm>=0.1.12",
+    "teedeelee>=0.1.0",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
     "treeswift>=1.1.45",

@@ -124,6 +124,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "smallperm" },
+    { name = "teedeelee" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "treeswift" },
@@ -145,6 +146,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=19.0.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "smallperm", specifier = ">=0.1.12" },
+    { name = "teedeelee", specifier = ">=0.1.0" },
     { name = "torch", specifier = ">=2.5.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "treeswift", specifier = ">=1.1.45" },
@@ -695,6 +697,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ca/99/5a5b6f19ff9f083671ddf7b9632028436167cd3d33e11015754e41b249a4/sympy-1.13.1.tar.gz", hash = "sha256:9cebf7e04ff162015ce31c9c6c9144daa34a93bd082f54fd8f12deca4f47515f", size = 7533040 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b2/fe/81695a1aa331a842b582453b605175f419fe8540355886031328089d840a/sympy-1.13.1-py3-none-any.whl", hash = "sha256:db36cdc64bf61b9b24578b6f7bab1ecdd2452cf008f34faa33776680c26d66f8", size = 6189177 },
+]
+
+[[package]]
+name = "teedeelee"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/81/28d30c2a1dc8afc47360c1b06e30c31773f1f0263471da8a8398f4179811/teedeelee-0.1.0.tar.gz", hash = "sha256:cffc674f852e24bd772cf23f59f63e6c792d6253afd4f25131889fd4608ea636", size = 260839 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/1f/75b95aa93a96a6a2e85f0c2c8c75b7bb093888a1536385117de928aa8069/teedeelee-0.1.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:cc4421a230351002a78efde8d3fd0b5deba0dc2d7295bda426e2187b6184f36e", size = 630475 },
 ]
 
 [[package]]
