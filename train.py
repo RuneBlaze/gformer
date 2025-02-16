@@ -21,6 +21,7 @@ except ImportError:
 
 from constants import EOS, PAD, VOCAB_SIZE
 from data import TreeDataset
+from tokenizer import NewickTokenizer
 from layers import ModelConfig, TreeTransformer
 
 
@@ -536,6 +537,7 @@ def main():
             if accelerator.is_local_main_process:
                 logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
                 logger.info("Example completions:")
+                tokenizer = NewickTokenizer()
                 show_example_completions(model, val_loader, device, tokenizer)
 
                 # Save checkpoint if we've hit the save interval
