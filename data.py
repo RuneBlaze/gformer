@@ -3,7 +3,6 @@ import json
 import random
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
-from typing import List, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -94,7 +93,7 @@ class TreeDataset(Dataset):
             num_workers: Number of processes for parallel preprocessing
         """
         self.max_sequence_length = max_sequence_length
-        self.data: List[InputPair] = []
+        self.data: list[InputPair] = []
         self.tokenizer = NewickTokenizer()
         self.cached_encodings = []
         self.num_workers = min(num_workers, cpu_count())
@@ -161,7 +160,7 @@ class TreeDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def encode_trees(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_trees(self, pair: InputPair) -> tuple[torch.Tensor, torch.Tensor]:
         encoded_trees = []
         for tree in pair.gtrees:
             distance_matrix = InputPair.newick_to_distance_matrix(tree)
@@ -179,7 +178,7 @@ class TreeDataset(Dataset):
 
         return tree_tensor, species_tokens
 
-    def _encode_single_item(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_single_item(self, pair: InputPair) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a single item for parallel processing"""
         return self.encode_trees(pair)
 
@@ -204,12 +203,12 @@ class TreeDataset(Dataset):
                     console.print(f"Processed {processed}/{total} trees")
 
     def _encode_chunk(
-        self, pairs: List[InputPair]
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        self, pairs: list[InputPair]
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Encode a chunk of items"""
         return [self.encode_trees(pair) for pair in pairs]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         tree_tensor, species_tokens = self.cached_encodings[idx]
 
         # Get actual number of trees
