@@ -405,6 +405,11 @@ def main():
         type=int,
         help="Save checkpoint every N epochs (overrides config file)",
     )
+    train_parser.add_argument(
+        "--init-from",
+        type=str,
+        help="Initialize model weights from this checkpoint path",
+    )
 
     # Count parameters subcommand
     count_parser = subparsers.add_parser("count-params", help="Count model parameters")
@@ -454,6 +459,13 @@ def main():
         device = accelerator.device
         config = ModelConfig.from_yaml(args.config)
         model = TreeTransformer(config)
+
+        # Load initial weights if specified
+        if args.init_from:
+            logger.info(f"Initializing model weights from {args.init_from}")
+            checkpoint = torch.load(args.init_from, map_location=device)
+            # Only load model weights, ignore other checkpoint contents
+            model.load_state_dict(checkpoint["model_state_dict"])
 
         # Create datasets and dataloaders
         train_dataset = TreeDataset(
