@@ -106,7 +106,6 @@ class ModelConfig:
             config = yaml.safe_load(f)
         # Merge model and training sections
         model_config = config["model"]
-        model_config.update(config["training"])
         return cls(**model_config)
 
 
