@@ -7,10 +7,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 try:
     from transformers.optimization import Adafactor

@@ -151,7 +151,7 @@ class TreeDataset(Dataset):
 
     def _load_from_jsonl(self, jsonl_path: str):
         """Load data from jsonl file (legacy support)"""
-        with open(jsonl_path, "r") as f:
+        with open(jsonl_path) as f:
             for line in f:
                 item = json.loads(line)
                 self.data.append(

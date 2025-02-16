@@ -1,7 +1,7 @@
+import multiprocessing as mp
 import random
 from pathlib import Path
 from typing import Dict, List, Set
-import multiprocessing as mp
 
 import pandas as pd
 import treeswift as ts

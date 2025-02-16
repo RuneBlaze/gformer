@@ -1,9 +1,11 @@
-import treeswift as ts
-from random import getrandbits
+from dataclasses import dataclass
 from functools import reduce
 from operator import xor
-from typing import Dict, Set, Iterator, Tuple
-from dataclasses import dataclass
+from random import getrandbits
+from typing import Dict, Set, Tuple
+from collections.abc import Iterator
+
+import treeswift as ts
 
 
 @dataclass
