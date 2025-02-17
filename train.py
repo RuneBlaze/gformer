@@ -426,6 +426,56 @@ def show_example_completions(
                     break
 
 
+def val_epoch(model: "TreeTransformer", dataloader: "DataLoader", accelerator: "Accelerator", device: torch.device) -> dict:
+    """
+    Run a single epoch of validation and compute average loss and token-level accuracy.
+
+    Args:
+        model (TreeTransformer): The transformer model.
+        dataloader (DataLoader): Validation data loader.
+        accelerator (Accelerator): Accelerator for any potential distributed operations.
+        device (torch.device): Device to perform evaluation on.
+
+    Returns:
+        dict: Dictionary containing the average 'loss' and 'accuracy' over the validation set.
+    """
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for tree_encodings, target_seq in dataloader:
+            tree_encodings = tree_encodings.to(device)
+            target_seq = target_seq.to(device)
+            
+            # Use teacher forcing: predict next token given input target sequence (excluding last token)
+            logits = model(
+                tree_encodings=tree_encodings,
+                output_tokens=target_seq[:, :-1],
+                attention_mask=None,
+            )
+            
+            # Compute loss with targets shifted by one token
+            loss = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                target_seq[:, 1:].reshape(-1),
+                ignore_index=PAD,
+            )
+            total_loss += loss.item()
+            
+            # Compute accuracy by comparing predicted tokens with target tokens (ignoring PAD tokens)
+            preds = logits.argmax(dim=-1)
+            mask = target_seq[:, 1:] != PAD
+            total_correct += (preds == target_seq[:, 1:]).masked_select(mask).sum().item()
+            total_tokens += mask.sum().item()
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+
+    return {"loss": avg_loss, "accuracy": accuracy}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train TreeTransformer model")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -552,7 +602,6 @@ def main():
         )
 
         # Training loop
-        best_val_loss = float("inf")
         for epoch in range(args.epochs):
             train_loss = train_epoch(
                 model,
@@ -566,6 +615,11 @@ def main():
             # Only log on main process
             if accelerator.is_local_main_process:
                 logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
+
+                # Run validation loop and log metrics
+                val_metrics = val_epoch(model, val_loader, accelerator, device)
+                logger.info(f"Epoch {epoch} - Val loss: {val_metrics['loss']:.4f} - Val accuracy: {val_metrics['accuracy']:.4f}")
+
                 logger.info("Example completions:")
                 show_example_completions(model, val_loader, device, tokenizer)
 
@@ -577,7 +631,6 @@ def main():
                     checkpoint_path = os.path.join(
                         args.save_dir, f"model_epoch_{epoch}.pt"
                     )
-                    # Use accelerator's save/load methods
                     accelerator.save(
                         {
                             "epoch": epoch,
