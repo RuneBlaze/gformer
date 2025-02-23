@@ -8,3 +8,5 @@ MAX_GTREES = 300  # or a smaller/larger limit you know won't exceed the actual d
 INTERNAL_NODE = VOCAB_SIZE - 2  # Internal node token
 EOS = VOCAB_SIZE - 1  # End of sequence token
 PAD = VOCAB_SIZE - 3  # Padding token
+
+QUARTET_SAMPLES = 64

@@ -236,8 +236,15 @@ class GeneTreesEncoder(nn.Module):
         )
         self._check_nan(tree_encodings, "reshaped tree_encodings")
 
+        # Compute mask for padded entries (flattened, shape: [b*g])
+        flattened_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0)
+
+        # Process through MLP
         encoded_trees = self.tree_embedding(tree_encodings)
         self._check_nan(encoded_trees, "MLP output (encoded_trees)")
+
+        # Zero-out outputs for padded gene trees to cancel out MLP bias
+        encoded_trees = encoded_trees * (~flattened_padding_mask).unsqueeze(-1).type_as(encoded_trees)
 
         # Reshape back for encoder input
         encoder_input = einops.rearrange(
@@ -245,10 +252,8 @@ class GeneTreesEncoder(nn.Module):
         )
         self._check_nan(encoder_input, "encoder_input")
 
-        # Create padding mask based on zero vectors
-        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(
-            batch_size, num_gene_trees
-        )
+        # Create padding mask based on flattened tree encodings
+        tree_padding_mask = flattened_padding_mask.view(batch_size, num_gene_trees)
 
         # Run Transformer encoder
         memory = self.encoder(encoder_input, src_key_padding_mask=tree_padding_mask)
@@ -257,7 +262,7 @@ class GeneTreesEncoder(nn.Module):
         return memory, tree_padding_mask
 
 
-class TreeDecoder(nn.Module):
+class RootedSpeciesTreeDecoder(nn.Module):
     """Decodes memory into a sequence of tokens representing the species tree."""
     
     def __init__(self, config: ModelConfig):
@@ -404,7 +409,7 @@ class RootedSpeciesTreeInferer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.encoder = GeneTreesEncoder(config)
-        self.decoder = TreeDecoder(config)
+        self.decoder = RootedSpeciesTreeDecoder(config)
 
     def forward(
         self,
@@ -425,3 +430,125 @@ class RootedSpeciesTreeInferer(nn.Module):
         """
         memory, _ = self.encoder(tree_encodings)
         return self.decoder(memory, output_tokens, attention_mask)
+
+
+class QuartetDecider(nn.Module):
+    """
+    Module that decides between possible quartet arrangements based on gene tree memory.
+    Takes batches of 16-dimensional boolean vectors (quartet queries) and gene tree memory as input,
+    and outputs probabilities for the three possible quartet arrangements (AB|CD, AC|BD, AD|BC).
+    Zero vectors in quartet_queries are treated as padding.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        
+        # Encoder for quartet query tokens
+        self.query_encoder = nn.Sequential(
+            nn.Linear(16, config.embedding_dim * 2),
+            nn.SiLU(),
+            nn.Linear(config.embedding_dim * 2, config.embedding_dim)
+        )
+
+        # Cross-attention layer
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=config.embedding_dim,
+            num_heads=config.num_heads,
+            batch_first=True
+        )
+
+        # Final MLP for quartet decisions
+        self.decision_mlp = nn.Sequential(
+            nn.Linear(config.embedding_dim * 2, config.embedding_dim),
+            nn.SiLU(),
+            nn.Linear(config.embedding_dim, 3),  # 3 possible quartet arrangements. Output logits directly.
+        )
+
+    def forward(
+        self, 
+        quartet_queries: torch.Tensor, 
+        gene_tree_memory: torch.Tensor,
+        gene_tree_padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Forward pass through the quartet decider.
+
+        Args:
+            quartet_queries: Boolean tensor of shape [batch_size, num_quartets, 16]
+                           Zero vectors are treated as padding.
+            gene_tree_memory: Encoded gene trees from GeneTreesEncoder [batch_size, num_gene_trees, embedding_dim]
+            gene_tree_padding_mask: Optional masking for padded gene trees [batch_size, num_gene_trees]
+
+        Returns:
+            torch.Tensor: Probability distributions over the three possible quartet arrangements.
+        """
+        batch_size, num_quartets, _ = quartet_queries.shape
+
+        # Create padding mask based on zero vectors for quartet queries
+        # Explicitly cast boolean to float so that False becomes 0.0 and True becomes 1.0,
+        # then sum the values.
+        padding_mask = (quartet_queries.float().sum(dim=-1) == 0)  # [batch_size, num_quartets]
+
+        # Encode quartet queries
+        query_embeddings = self.query_encoder(quartet_queries.float())  
+        # Shape: [batch_size, num_quartets, embedding_dim]
+
+        # Cross-attention between queries and gene tree memory
+        attended_memory, _ = self.cross_attention(
+            query=query_embeddings,
+            key=gene_tree_memory,
+            value=gene_tree_memory,
+            key_padding_mask=gene_tree_padding_mask,
+            need_weights=False
+        )  # Shape: [batch_size, num_quartets, embedding_dim]
+
+        # Concatenate query embeddings and attended memory
+        decision_input = torch.cat(
+            [query_embeddings, attended_memory],
+            dim=-1
+        )  # Shape: [batch_size, num_quartets, embedding_dim * 2]
+
+        # Get quartet logits
+        quartet_logits = self.decision_mlp(decision_input)  # Shape: [batch_size, num_quartets, 3]
+
+        # Set padded positions to -infinity
+        quartet_logits = quartet_logits.masked_fill(
+            padding_mask.unsqueeze(-1),
+            float('-inf')
+        )
+
+        return quartet_logits
+
+
+class FusedQuartetDecider(nn.Module):
+    """
+    Fused version of GeneTreesEncoder + QuartetDecider that processes gene trees and quartet queries together.
+    Simply composes the two modules for a more convenient interface.
+    """
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.encoder = GeneTreesEncoder(config)
+        self.decider = QuartetDecider(config)
+
+    def forward(
+        self,
+        tree_encodings: torch.Tensor,
+        quartet_queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through the fused model.
+
+        Args:
+            tree_encodings: Tensor of shape [batch_size, num_gene_trees, num_distances, 8]
+            quartet_queries: Boolean tensor of shape [batch_size, num_quartets, 16]
+                           Zero vectors are used as padding.
+
+        Returns:
+            torch.Tensor: Logits for quartet decisions.
+                         Shape: [batch_size, num_quartets, 3] where indices represent:
+                         0: AB|CD, 1: AC|BD, 2: AD|BC.
+        """
+        # Now capture the gene tree padding mask from the encoder output.
+        memory, gene_tree_mask = self.encoder(tree_encodings)
+        return self.decider(quartet_queries, memory, gene_tree_mask)

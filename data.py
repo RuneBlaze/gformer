@@ -1,9 +1,8 @@
 import argparse
-import json
 import random
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
-from typing import List, Tuple
+from typing import List, Tuple, Literal, Union
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -12,8 +11,9 @@ import torch.nn.functional as F
 import treeswift as ts
 from rich.console import Console
 from torch.utils.data import Dataset
+import xxhash
 
-from constants import MAX_GTREES, MAX_TAXA, PAD
+from constants import MAX_GTREES, MAX_TAXA, PAD, QUARTET_SAMPLES
 from tokenizer import NewickTokenizer
 
 console = Console()
@@ -43,6 +43,10 @@ class InputPair:
 
         # Get sorted list of taxa names to ensure consistent ordering
         taxa = sorted(dist_dict.keys())
+        taxa_set = set(taxa)
+        for i in range(MAX_TAXA):
+            if str(i) not in taxa_set:
+                raise ValueError(f"Taxon {i} not found in tree {newick_str}")
         n = MAX_TAXA
 
         # Create numpy array from distance dictionary
@@ -52,6 +56,57 @@ class InputPair:
                 if i != j:
                     dist_matrix[i, j] = int(dist_dict[u][v])
         return dist_matrix
+
+    @staticmethod
+    def decide_quartet_topology(distance_matrix: np.ndarray, abcd: tuple[int, int, int, int]) -> Literal[0, 1, 2]:
+        # (AB|CD, AC|BD, AD|BC)
+        abcd = tuple(sorted(abcd))
+        a, b, c, d = abcd
+        
+        # Calculate the three possible sums of pairwise distances
+        ab_cd = distance_matrix[a,b] + distance_matrix[c,d]  # supports AB|CD
+        ac_bd = distance_matrix[a,c] + distance_matrix[b,d]  # supports AC|BD
+        ad_bc = distance_matrix[a,d] + distance_matrix[b,c]  # supports AD|BC
+        
+        # Find which sum is smallest
+        sums = [ab_cd, ac_bd, ad_bc]
+        return sums.index(min(sums))
+
+    
+    def generate_queries_and_gt(self, num_samples: int) -> tuple[np.ndarray, np.ndarray]:
+        # Create a hash from the first 3 gtrees and stree for seeding
+        hasher = xxhash.xxh64()
+        for tree in self.gtrees[:3]:
+            hasher.update(tree.encode())
+        hasher.update(self.stree.encode())
+        seed = hasher.intdigest()
+        rng = np.random.RandomState(seed % 2**32)
+        
+        # Initialize output arrays
+        queries = np.zeros((num_samples, 4), dtype=np.int32)
+        gt = np.zeros(num_samples, dtype=np.int32)
+        stree_matrix = self.newick_to_distance_matrix(self.stree)
+        # Generate samples
+        sample_idx = 0
+        while sample_idx < num_samples:
+            # Generate a random 4-combination
+            quartet = tuple(sorted(rng.choice(MAX_TAXA, size=4, replace=False)))
+            
+            # Get topology from species tree (ground truth)
+            topology = self.decide_quartet_topology(stree_matrix, quartet)
+            
+            # Add to outputs
+            queries[sample_idx] = quartet
+            gt[sample_idx] = topology
+            sample_idx += 1
+        
+        # Convert queries to one-hot encoding
+        queries_onehot = np.zeros((num_samples, MAX_TAXA * 4), dtype=bool)
+        for i in range(num_samples):
+            for j, taxon in enumerate(queries[i]):
+                queries_onehot[i, j * MAX_TAXA + taxon] = True
+            
+        return queries_onehot, gt
 
 
 def encode_distance_matrix(distance_matrix: np.ndarray) -> torch.Tensor:
@@ -82,30 +137,32 @@ class TreeDataset(Dataset):
         val_ratio: float = 0.2,
         seed: int = 42,
         num_workers: int = 4,
+        num_quartets: int = QUARTET_SAMPLES,
+        is_quartet_classification: bool = False,
     ):
         """
         Initialize the dataset.
 
         Args:
-            data_source: Path to either .jsonl or .parquet file
+            data_source: Path to parquet file
             max_sequence_length: Maximum sequence length for tokenization
             split: Either 'train' or 'val'
             val_ratio: Ratio of directories to use for validation
             seed: Random seed for reproducibility
             num_workers: Number of processes for parallel preprocessing
+            num_quartets: Number of quartet queries to generate per tree
+            is_quartet_classification: If True, return quartet queries and labels instead of species tree
         """
         self.max_sequence_length = max_sequence_length
         self.data: List[InputPair] = []
         self.tokenizer = NewickTokenizer()
         self.cached_encodings = []
         self.num_workers = min(num_workers, cpu_count())
+        self.is_quartet_classification = is_quartet_classification
+        self.num_quartets = num_quartets
 
         random.seed(seed)
-
-        if data_source.endswith(".parquet"):
-            self._load_from_parquet(data_source, split, val_ratio)
-        else:
-            self._load_from_jsonl(data_source)
+        self._load_from_parquet(data_source, split, val_ratio)
 
         console.print(
             f"Pre-encoding trees for {split} split using {self.num_workers} processes..."
@@ -150,15 +207,6 @@ class TreeDataset(Dataset):
                 InputPair(gtrees=row["gtrees"], stree=stree.newick().lstrip("[&R] "))
             )
 
-    def _load_from_jsonl(self, jsonl_path: str):
-        """Load data from jsonl file (legacy support)"""
-        with open(jsonl_path, "r") as f:
-            for line in f:
-                item = json.loads(line)
-                self.data.append(
-                    InputPair(gtrees=item["gtrees"], stree=item["species_tree"])
-                )
-
     def __len__(self) -> int:
         return len(self.data)
 
@@ -180,9 +228,18 @@ class TreeDataset(Dataset):
 
         return tree_tensor, species_tokens
 
-    def _encode_single_item(self, pair: InputPair) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_single_item(self, pair: InputPair) -> dict:
         """Encode a single item for parallel processing"""
-        return self.encode_trees(pair)
+        tree_tensor, species_tokens = self.encode_trees(pair)
+        
+        if self.is_quartet_classification:
+            quartet_queries, gt = pair.generate_queries_and_gt(self.num_quartets)
+            return {
+                'tree_tensor': tree_tensor,
+                'quartet_queries': quartet_queries,
+                'gt': gt
+            }
+        return {'tree_tensor': tree_tensor, 'species_tokens': species_tokens}
 
     def _parallel_encode_trees(self):
         """Parallel processing of tree encoding using chunks"""
@@ -193,7 +250,7 @@ class TreeDataset(Dataset):
                 self.data[i : i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)
             ]
 
-            with console.status(f"[bold green]Processing trees...") as status:
+            with console.status("[bold green]Processing trees...") as status:
                 processed = 0
                 for chunk_results in pool.imap(
                     self._encode_chunk,
@@ -206,12 +263,13 @@ class TreeDataset(Dataset):
 
     def _encode_chunk(
         self, pairs: List[InputPair]
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> List[dict]:
         """Encode a chunk of items"""
-        return [self.encode_trees(pair) for pair in pairs]
+        return [self._encode_single_item(pair) for pair in pairs]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        tree_tensor, species_tokens = self.cached_encodings[idx]
+    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor], dict]:
+        encoded_data = self.cached_encodings[idx]
+        tree_tensor = encoded_data['tree_tensor']
 
         # Get actual number of trees
         num_gene_trees = min(tree_tensor.size(0), MAX_GTREES)
@@ -224,13 +282,20 @@ class TreeDataset(Dataset):
         # Copy actual tree encodings
         padded_tree_tensor[:num_gene_trees] = tree_tensor[:num_gene_trees]
 
-        return padded_tree_tensor, species_tokens
+        if self.is_quartet_classification:
+            return {
+                'gtrees': padded_tree_tensor,
+                'quartet_queries': torch.from_numpy(encoded_data['quartet_queries']).float(),
+                'Y': torch.from_numpy(encoded_data['gt']).long()
+            }
+        
+        return padded_tree_tensor, encoded_data['species_tokens']
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Tree Dataset Loader")
     parser.add_argument(
-        "data_path", type=str, help="Path to data file (.jsonl or .parquet)"
+        "data_path", type=str, help="Path to parquet file"
     )
     parser.add_argument(
         "--max-seq-length",
@@ -253,55 +318,88 @@ def parse_args():
         default=4,
         help="Number of processes for parallel preprocessing",
     )
+    parser.add_argument(
+        "--quartet-mode",
+        action="store_true",
+        help="Show example in quartet classification mode",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Tree Dataset Loader")
+    parser.add_argument(
+        "data_path", type=str, help="Path to parquet file"
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=1024,
+        help="Maximum sequence length for tokenization",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Ratio of directories to use for validation (for parquet files)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of processes for parallel preprocessing",
+    )
+    parser.add_argument(
+        "--quartet-mode",
+        action="store_true",
+        help="Show example in quartet classification mode",
+    )
+    args = parser.parse_args()
 
     # Create datasets
-    if args.data_path.endswith(".parquet"):
-        train_dataset = TreeDataset(
-            args.data_path,
-            max_sequence_length=args.max_seq_length,
-            split="train",
-            val_ratio=args.val_ratio,
-            seed=args.seed,
-            num_workers=args.num_workers,
-        )
-        val_dataset = TreeDataset(
-            args.data_path,
-            max_sequence_length=args.max_seq_length,
-            split="val",
-            val_ratio=args.val_ratio,
-            seed=args.seed,
-            num_workers=args.num_workers,
-        )
+    train_dataset = TreeDataset(
+        args.data_path,
+        max_sequence_length=args.max_seq_length,
+        split="train",
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        is_quartet_classification=args.quartet_mode,
+    )
+    val_dataset = TreeDataset(
+        args.data_path,
+        max_sequence_length=args.max_seq_length,
+        split="val",
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        is_quartet_classification=args.quartet_mode,
+    )
 
-        console.print(f"[green]Dataset loaded successfully!")
-        console.print(f"Train size: {len(train_dataset)}")
-        console.print(f"Val size: {len(val_dataset)}")
-    else:
-        # Legacy jsonl support
-        dataset = TreeDataset(
-            args.data_path, args.max_seq_length, num_workers=args.num_workers
-        )
-        console.print(f"[green]Dataset loaded successfully!")
-        console.print(f"Dataset size: {len(dataset)}")
+    console.print(f"[green]Dataset loaded successfully!")
+    console.print(f"Train size: {len(train_dataset)}")
+    console.print(f"Val size: {len(val_dataset)}")
 
     # Look at first few items
     console.print("\n[yellow]Sample items:[/yellow]")
-    dataset_to_inspect = (
-        train_dataset if args.data_path.endswith(".parquet") else dataset
-    )
-
-    for i in range(min(3, len(dataset_to_inspect))):
-        tree_tensor, species_tokens = dataset_to_inspect[i]
+    for i in range(min(3, len(train_dataset))):
+        item = train_dataset[i]
         console.print(f"\n[cyan]Item {i}:[/cyan]")
-        console.print(f"Tree tensor shape: {tree_tensor.shape}")
-        console.print(f"Species tokens shape: {species_tokens.shape}")
-        console.print(f"First few species tokens: {species_tokens[:10]}")
-        console.print(f"Tree tensor: {tree_tensor[:, :10]}")
-        # Add decoded species tree output
-        decoded_stree = dataset_to_inspect.tokenizer.decode(species_tokens.tolist())
-        console.print(f"Decoded species tree: {decoded_stree}")
+        
+        if args.quartet_mode:
+            console.print(f"Gene trees tensor shape: {item['gtrees'].shape}")
+            console.print(f"Quartet queries shape: {item['quartet_queries'].shape}")
+            console.print(f"Ground truth labels shape: {item['Y'].shape}")
+            console.print(f"First few quartet queries:\n{item['quartet_queries'][:3]}")
+            console.print(f"First few labels: {item['Y'][:3]}")
+        else:
+            tree_tensor, species_tokens = item
+            console.print(f"Tree tensor shape: {tree_tensor.shape}")
+            console.print(f"Species tokens shape: {species_tokens.shape}")
+            console.print(f"First few species tokens: {species_tokens[:10]}")
+            console.print(f"Tree tensor: {tree_tensor[:, :10]}")
+            decoded_stree = train_dataset.tokenizer.decode(species_tokens.tolist())
+            console.print(f"Decoded species tree: {decoded_stree}")

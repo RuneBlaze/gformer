@@ -17,6 +17,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "treeswift>=1.1.45",
     "typer>=0.15.1",
+    "xxhash>=3.5.0",
 ]
 
 [tool.uv]
