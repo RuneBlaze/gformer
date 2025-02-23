@@ -445,7 +445,7 @@ class QuartetDecider(nn.Module):
         
         # Encoder for quartet query tokens
         self.query_encoder = nn.Sequential(
-            nn.Linear(16, config.embedding_dim * 2),
+            nn.Linear(MAX_TAXA * 4, config.embedding_dim * 2),
             nn.SiLU(),
             nn.Linear(config.embedding_dim * 2, config.embedding_dim)
         )

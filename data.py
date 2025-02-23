@@ -13,7 +13,7 @@ from rich.console import Console
 from torch.utils.data import Dataset
 import xxhash
 
-from constants import MAX_GTREES, MAX_TAXA, PAD, QUARTET_SAMPLES
+from constants import MAX_GTREES, MAX_TAXA, QUARTET_SAMPLES
 from tokenizer import NewickTokenizer
 
 console = Console()
@@ -41,8 +41,8 @@ class InputPair:
         # Get distance matrix as dictionary using TreeSwift's built-in method
         dist_dict = tree.distance_matrix(leaf_labels=True)
 
-        # Get sorted list of taxa names to ensure consistent ordering
-        taxa = sorted(dist_dict.keys())
+        # Get sorted list of taxa names (numerical sort) to ensure consistent ordering
+        taxa = sorted(dist_dict.keys(), key=lambda x: int(x))
         taxa_set = set(taxa)
         for i in range(MAX_TAXA):
             if str(i) not in taxa_set:
@@ -78,6 +78,7 @@ class InputPair:
         hasher = xxhash.xxh64()
         for tree in self.gtrees[:3]:
             hasher.update(tree.encode())
+        hasher.update(str(len(self.gtrees)).encode())
         hasher.update(self.stree.encode())
         seed = hasher.intdigest()
         rng = np.random.RandomState(seed % 2**32)
@@ -267,6 +268,15 @@ class TreeDataset(Dataset):
         """Encode a chunk of items"""
         return [self._encode_single_item(pair) for pair in pairs]
 
+    def _decode_quartet_query(self, query: torch.Tensor) -> List[int]:
+        """Convert one-hot encoded quartet query back to taxon indices (0-indexed)"""
+        taxa = []
+        for i in range(4):  # 4 positions in quartet
+            # Get the index of 1 in each block of MAX_TAXA; these indices are 0-indexed.
+            taxon = query[i * MAX_TAXA:(i + 1) * MAX_TAXA].nonzero().item()
+            taxa.append(taxon)
+        return taxa
+
     def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor], dict]:
         encoded_data = self.cached_encodings[idx]
         tree_tensor = encoded_data['tree_tensor']
@@ -283,10 +293,13 @@ class TreeDataset(Dataset):
         padded_tree_tensor[:num_gene_trees] = tree_tensor[:num_gene_trees]
 
         if self.is_quartet_classification:
+            quartet_queries = torch.from_numpy(encoded_data['quartet_queries']).float()
+            gt = torch.from_numpy(encoded_data['gt']).long()
             return {
                 'gtrees': padded_tree_tensor,
-                'quartet_queries': torch.from_numpy(encoded_data['quartet_queries']).float(),
-                'Y': torch.from_numpy(encoded_data['gt']).long()
+                'quartet_queries': quartet_queries,
+                'Y': gt,
+                'stree': self.data[idx].stree  # Add species tree string
             }
         
         return padded_tree_tensor, encoded_data['species_tokens']
@@ -393,8 +406,20 @@ if __name__ == "__main__":
             console.print(f"Gene trees tensor shape: {item['gtrees'].shape}")
             console.print(f"Quartet queries shape: {item['quartet_queries'].shape}")
             console.print(f"Ground truth labels shape: {item['Y'].shape}")
-            console.print(f"First few quartet queries:\n{item['quartet_queries'][:3]}")
-            console.print(f"First few labels: {item['Y'][:3]}")
+            console.print(f"Species tree: {item['stree']}")
+            console.print("\nFirst few quartet queries (0-indexed):")
+            for j in range(10):  # Show first 10 queries
+                taxa = train_dataset._decode_quartet_query(item['quartet_queries'][j])
+                label = item['Y'][j].item()
+                topology_map = {0: "AB|CD", 1: "AC|BD", 2: "AD|BC"}
+                console.print(f"Query {j+1}: Taxa {taxa}, Topology: {topology_map[label]}")
+                
+                # The decoded taxa are already 0-indexed, which is consistent with the species tree labels.
+                quartet_labels = [str(t) for t in taxa]
+                labels_set = set(quartet_labels)
+                species_tree = ts.read_tree_newick(item['stree'])
+                extracted_subtree = species_tree.extract_tree_with(labels_set, suppress_unifurcations=True)
+                console.print(f"Extracted subtree for Query {j+1}: {extracted_subtree.newick()}")
         else:
             tree_tensor, species_tokens = item
             console.print(f"Tree tensor shape: {tree_tensor.shape}")
