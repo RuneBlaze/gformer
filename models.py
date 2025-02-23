@@ -126,27 +126,17 @@ class TrainingConfig:
         return cls(**training_config)
 
 
-class TreeTransformer(nn.Module):
-    """
-    Encoder-decoder transformer model for processing gene trees and generating species trees.
-    """
-
+class GeneTreesEncoder(nn.Module):
+    """Encodes multiple gene trees into a memory representation."""
+    
     def __init__(self, config: ModelConfig):
         super().__init__()
-
-        # Token embedding layer
-        self.token_embedding = nn.Embedding(VOCAB_SIZE, config.embedding_dim)
-
+        
         # Tree embedding MLP
         self.tree_embedding = DistanceMatrixMLP(
-            num_taxa=MAX_TAXA,  # Use MAX_TAXA from constants
+            num_taxa=MAX_TAXA,
             hidden_dim=config.embedding_dim * 2,
             output_dim=config.embedding_dim,
-        )
-
-        # Positional encoding
-        self.pos_encoding = PositionalEncoding(
-            config.embedding_dim, config.max_sequence_length
         )
 
         # Encoder layers
@@ -159,6 +149,126 @@ class TreeTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=config.num_layers
+        )
+
+    def _check_nan(self, tensor: torch.Tensor, step_name: str) -> None:
+        """Helper method to check for NaN values"""
+        if torch.isnan(tensor).any():
+            nan_mask = torch.isnan(tensor)
+            nan_count = nan_mask.sum().item()
+
+            # Get basic stats
+            basic_info = (
+                f"NaN detected in {step_name}!\n"
+                f"Total NaNs: {nan_count}\n"
+                f"Tensor shape: {tensor.shape}\n"
+            )
+
+            # Analyze NaN distribution across dimensions
+            dim_info = "NaN distribution across dimensions:\n"
+            for dim in range(tensor.dim()):
+                nan_per_slice = nan_mask.sum(
+                    dim=tuple(d for d in range(tensor.dim()) if d != dim)
+                )
+                nan_indices = torch.where(nan_per_slice > 0)[0].tolist()
+                dim_info += f"Dimension {dim}: {len(nan_indices)}/{tensor.shape[dim]} slices contain NaNs\n"
+                if len(nan_indices) < 10:  # Only show indices if there aren't too many
+                    dim_info += f"    Indices with NaNs: {nan_indices}\n"
+
+            # For 3D tensors (batch, sequence, features), analyze batch-wise patterns
+            if tensor.dim() == 3:
+                batch_info = "Batch analysis:\n"
+                for b in range(tensor.shape[0]):
+                    batch_nan_count = nan_mask[b].sum().item()
+                    if batch_nan_count > 0:
+                        batch_info += (
+                            f"Batch {b}: {batch_nan_count} NaNs "
+                            f"({batch_nan_count / (tensor.shape[1] * tensor.shape[2]):.1%} of elements)\n"
+                        )
+
+            # Get statistics of non-NaN values
+            valid_values = tensor[~nan_mask]
+            if len(valid_values) > 0:
+                value_info = (
+                    f"Non-NaN value range: [{valid_values.min():.3f}, {valid_values.max():.3f}]\n"
+                    f"Non-NaN mean: {valid_values.mean():.3f}, std: {valid_values.std():.3f}\n"
+                )
+            else:
+                value_info = "No valid values found - tensor contains all NaNs\n"
+
+            # Check if the NaNs form a specific pattern (e.g., all in one feature dimension)
+            pattern_info = "Pattern analysis:\n"
+            if tensor.dim() == 3:
+                feature_nan_count = nan_mask.sum(dim=(0, 1))
+                seq_nan_count = nan_mask.sum(dim=(0, 2))
+                if torch.all(feature_nan_count == feature_nan_count[0]):
+                    pattern_info += (
+                        "NaNs appear consistently across feature dimension\n"
+                    )
+                if torch.all(seq_nan_count == seq_nan_count[0]):
+                    pattern_info += (
+                        "NaNs appear consistently across sequence dimension\n"
+                    )
+
+            full_message = (
+                f"{basic_info}\n{dim_info}\n{value_info}\n"
+                f"{batch_info if tensor.dim() == 3 else ''}\n{pattern_info}"
+            )
+            raise ValueError(full_message)
+
+    def forward(self, tree_encodings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            tree_encodings: Tensor of shape [batch_size, num_gene_trees, num_distances, 8]
+        
+        Returns:
+            tuple of:
+                memory: Encoded representation [batch_size, num_gene_trees, embedding_dim]
+                padding_mask: Mask for padded trees [batch_size, num_gene_trees]
+        """
+        self._check_nan(tree_encodings, "input tree_encodings")
+
+        batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
+        
+        # Reshape tree encodings to process each gene tree through MLP
+        tree_encodings = einops.rearrange(
+            tree_encodings, "b g d bits -> (b g) (d bits)", bits=8
+        )
+        self._check_nan(tree_encodings, "reshaped tree_encodings")
+
+        encoded_trees = self.tree_embedding(tree_encodings)
+        self._check_nan(encoded_trees, "MLP output (encoded_trees)")
+
+        # Reshape back for encoder input
+        encoder_input = einops.rearrange(
+            encoded_trees, "(b g) e -> b g e", b=batch_size, g=num_gene_trees
+        )
+        self._check_nan(encoder_input, "encoder_input")
+
+        # Create padding mask based on zero vectors
+        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(
+            batch_size, num_gene_trees
+        )
+
+        # Run Transformer encoder
+        memory = self.encoder(encoder_input, src_key_padding_mask=tree_padding_mask)
+        self._check_nan(memory, "encoder output")
+
+        return memory, tree_padding_mask
+
+
+class TreeDecoder(nn.Module):
+    """Decodes memory into a sequence of tokens representing the species tree."""
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        
+        # Token embedding layer
+        self.token_embedding = nn.Embedding(VOCAB_SIZE, config.embedding_dim)
+
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(
+            config.embedding_dim, config.max_sequence_length
         )
 
         # Decoder layers
@@ -177,7 +287,7 @@ class TreeTransformer(nn.Module):
         self.output_projection = nn.Linear(config.embedding_dim, VOCAB_SIZE)
 
     def _check_nan(self, tensor: torch.Tensor, step_name: str) -> None:
-        """Helper method to check for NaN values and report the step where they occur with detailed diagnostics."""
+        """Helper method to check for NaN values"""
         if torch.isnan(tensor).any():
             nan_mask = torch.isnan(tensor)
             nan_count = nan_mask.sum().item()
@@ -243,38 +353,19 @@ class TreeTransformer(nn.Module):
 
     def forward(
         self,
-        tree_encodings: torch.Tensor,  # [batch_size, num_gene_trees, num_distances, 8]
-        output_tokens: torch.Tensor = None,  # [batch_size, seq_len]
+        memory: torch.Tensor,
+        output_tokens: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        self._check_nan(tree_encodings, "input tree_encodings")
-
-        batch_size, num_gene_trees, num_distances, bits = tree_encodings.shape
-        # Reshape tree encodings to process each gene tree through MLP
-        tree_encodings = einops.rearrange(
-            tree_encodings, "b g d bits -> (b g) (d bits)", bits=8
-        )
-        self._check_nan(tree_encodings, "reshaped tree_encodings")
-
-        encoded_trees = self.tree_embedding(tree_encodings)
-        self._check_nan(encoded_trees, "MLP output (encoded_trees)")
-
-        # Reshape back for encoder input
-        encoder_input = einops.rearrange(
-            encoded_trees, "(b g) e -> b g e", b=batch_size, g=num_gene_trees
-        )
-        self._check_nan(encoder_input, "encoder_input")
-
-        # Create padding mask based on zero vectors
-        # True indicates positions that should be masked (padded)
-        tree_padding_mask = (tree_encodings.abs().sum(dim=-1) == 0).view(
-            batch_size, num_gene_trees
-        )
-
-        # Run Transformer encoder
-        memory = self.encoder(encoder_input, src_key_padding_mask=tree_padding_mask)
-        self._check_nan(memory, "encoder output")
-
+        """
+        Args:
+            memory: Encoded representation from TreeEncoder
+            output_tokens: Target sequence tokens during training
+            attention_mask: Optional attention mask for training
+            
+        Returns:
+            logits: Output logits over vocabulary
+        """
         if output_tokens is not None:
             # Training mode
             token_embeddings = self.token_embedding(output_tokens)
@@ -302,3 +393,35 @@ class TreeTransformer(nn.Module):
         self._check_nan(logits, "final logits")
 
         return logits
+
+
+class RootedSpeciesTreeInferer(nn.Module):
+    """
+    Encoder-decoder transformer model for processing gene trees and generating species trees.
+    Now composed of separate encoder and decoder modules for flexibility.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.encoder = GeneTreesEncoder(config)
+        self.decoder = TreeDecoder(config)
+
+    def forward(
+        self,
+        tree_encodings: torch.Tensor,
+        output_tokens: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass through both encoder and decoder.
+        
+        Args:
+            tree_encodings: Input gene tree encodings
+            output_tokens: Target sequence tokens during training
+            attention_mask: Optional attention mask for training
+            
+        Returns:
+            logits: Output logits over vocabulary
+        """
+        memory, _ = self.encoder(tree_encodings)
+        return self.decoder(memory, output_tokens, attention_mask)
