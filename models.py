@@ -522,33 +522,111 @@ class QuartetDecider(nn.Module):
 
 class FusedQuartetDecider(nn.Module):
     """
-    Fused version of GeneTreesEncoder + QuartetDecider that processes gene trees and quartet queries together.
-    Simply composes the two modules for a more convenient interface.
+    New fused version that processes gene trees and quartet queries together by creating a single sequence of tokens,
+    running self-attention without positional encodings, and then applying a shared classification head on the attended
+    query tokens. Tokens corresponding to padded inputs are removed prior to self-attention.
     """
-    
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.encoder = GeneTreesEncoder(config)
-        self.decider = QuartetDecider(config)
+        # Tree embedding: process each gene tree into a token.
+        self.tree_embedder = DistanceMatrixMLP(
+            num_taxa=MAX_TAXA,
+            hidden_dim=config.embedding_dim * 2,
+            output_dim=config.embedding_dim,
+        )
+        # Query embedding: embed quartet queries.
+        self.query_embedding = nn.Sequential(
+            nn.Linear(MAX_TAXA * 4, config.embedding_dim * 2),
+            nn.SiLU(),
+            nn.Linear(config.embedding_dim * 2, config.embedding_dim),
+        )
+        # A transformer encoder layer for self-attention over the joint tokens.
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=config.embedding_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.mlp_hidden_dim,
+            batch_first=True,
+        )
+        # Shared classification head for attended query tokens.
+        self.classifier = nn.Linear(config.embedding_dim, 3)
 
-    def forward(
-        self,
-        tree_encodings: torch.Tensor,
-        quartet_queries: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, tree_encodings: torch.Tensor, quartet_queries: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the fused model.
-
         Args:
             tree_encodings: Tensor of shape [batch_size, num_gene_trees, num_distances, 8]
             quartet_queries: Boolean tensor of shape [batch_size, num_quartets, 16]
-                           Zero vectors are used as padding.
-
+                             Padded quartet queries have all zeros.
         Returns:
-            torch.Tensor: Logits for quartet decisions.
-                         Shape: [batch_size, num_quartets, 3] where indices represent:
-                         0: AB|CD, 1: AC|BD, 2: AD|BC.
+            Tensor: Quartet logits of shape [batch_size, num_quartets, 3].
+                    Padded queries will have logits set to -inf.
         """
-        # Now capture the gene tree padding mask from the encoder output.
-        memory, gene_tree_mask = self.encoder(tree_encodings)
-        return self.decider(quartet_queries, memory, gene_tree_mask)
+        batch_size = tree_encodings.shape[0]
+        num_gene_trees = tree_encodings.shape[1]
+        num_quartets = quartet_queries.shape[1]
+
+        # Determine valid gene trees: a gene tree is valid if its flattened sum is nonzero.
+        # Sum over the last two dims (num_distances and 8)
+        tree_valid_mask = (tree_encodings.abs().sum(dim=(-2, -1)) != 0)  # [b, num_gene_trees]
+
+        # Embed gene trees.
+        b, g, d, bits = tree_encodings.shape
+        tree_encodings_flat = tree_encodings.view(b * g, d * bits)
+        tree_tokens_flat = self.tree_embedder(tree_encodings_flat)  # [b*g, embedding_dim]
+        tree_tokens = tree_tokens_flat.view(b, g, -1)  # [batch_size, num_gene_trees, embedding_dim]
+
+        # Determine valid quartet queries.
+        query_valid_mask = (quartet_queries.float().sum(dim=-1) != 0)  # [b, num_quartets]
+        # Embed quartet queries.
+        query_tokens = self.query_embedding(quartet_queries.float())  # [batch_size, num_quartets, embedding_dim]
+
+        # For each sample, filter out padded tokens and concatenate tree and query tokens.
+        combined_tokens_list = []
+        valid_query_counts = []  # Track number of valid query tokens per sample.
+        for i in range(batch_size):
+            valid_tree_tokens = tree_tokens[i][tree_valid_mask[i]]  # [T_i, embedding_dim]
+            valid_query_tokens = query_tokens[i][query_valid_mask[i]]  # [Q_i, embedding_dim]
+            combined_tokens = torch.cat([valid_tree_tokens, valid_query_tokens], dim=0)  # [T_i + Q_i, embedding_dim]
+            combined_tokens_list.append(combined_tokens)
+            valid_query_counts.append(valid_query_tokens.shape[0])
+
+        # Pad combined tokens to form a batch tensor.
+        max_len = max(tokens.shape[0] for tokens in combined_tokens_list)
+        padded_tokens = torch.zeros(batch_size, max_len, tree_tokens.size(-1), device=tree_tokens.device)
+        padding_mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=tree_tokens.device)
+        lengths = []
+        for i in range(batch_size):
+            seq_len = combined_tokens_list[i].shape[0]
+            lengths.append(seq_len)
+            padded_tokens[i, :seq_len] = combined_tokens_list[i]
+            padding_mask[i, :seq_len] = False  # False indicates valid tokens.
+
+        # Apply self-attention over the joint tokens.
+        attended_tokens = self.transformer(padded_tokens, src_key_padding_mask=padding_mask)  # [batch_size, max_len, embedding_dim]
+
+        # Extract attended quartet query tokens for each sample.
+        outputs = []
+        for i in range(batch_size):
+            # Number of valid tree tokens in sample i.
+            num_valid_tree = tree_valid_mask[i].sum().item()
+            num_valid_query = valid_query_counts[i]
+            if num_valid_query > 0:
+                # Since tokens were concatenated as [tree_tokens, query_tokens],
+                # the attended query tokens are the ones after the tree tokens.
+                query_output = attended_tokens[i, num_valid_tree:num_valid_tree + num_valid_query, :]  # [Q_i, embedding_dim]
+                logits = self.classifier(query_output)  # [Q_i, 3]
+            else:
+                logits = torch.empty(0, 3, device=tree_tokens.device)
+            outputs.append((logits, num_valid_query))
+
+        # Reconstruct final output tensor with shape [batch_size, num_quartets, 3],
+        # filling padded query positions with -inf.
+        final_outputs = []
+        for i in range(batch_size):
+            sample_logits = torch.full((num_quartets, 3), float('-inf'), device=tree_tokens.device)
+            valid_indices = torch.nonzero(query_valid_mask[i], as_tuple=True)[0]
+            if valid_indices.numel() > 0:
+                # outputs[i][0] contains logits for valid queries in the same order.
+                sample_logits[valid_indices] = outputs[i][0]
+            final_outputs.append(sample_logits)
+        final_tensor = torch.stack(final_outputs, dim=0)  # [batch_size, num_quartets, 3]
+        return final_tensor
